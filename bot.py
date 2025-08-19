@@ -41,7 +41,7 @@ if not BOT_TOKEN:
 
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # stay safely below Telegram bot cap
+MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # keep under Telegram bot hard caps
 DEFAULT_UPLOAD_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()
 
 # Quotas / limits
@@ -52,7 +52,7 @@ QUOTA_DAILY_MB = int(os.environ.get("QUOTA_DAILY_MB", "8000"))              # pe
 
 # Allow/ban
 ALLOWLIST_IDS = [int(x) for x in os.environ.get("ALLOWLIST_IDS", "").split(",") if x.strip().isdigit()]
-BANLIST_IDS = [int(x) for x in os.environ.get("BANLIST_IDS", "").split(",") if x.strip().isdigit()]
+BANLIST_IDS    = [int(x) for x in os.environ.get("BANLIST_IDS", "").split(",") if x.strip().isdigit()]
 
 # S3 (optional)
 S3_ENABLE = os.environ.get("S3_ENABLE", "0").lower() in {"1", "true", "yes"}
@@ -235,7 +235,7 @@ def kb_formats(job_id: str, heights: List[int]):
     return kb.as_markup()
 
 # ===================== Edit helper =====================
-async def edit(job: Job, text: str, *, throttle: float = 1.1, show_compress: bool = False):
+async def edit(job: Job, text: str, *, throttle: float = 1.0, show_compress: bool = False):
     now = time.time()
     if now - job.last_edit < throttle:
         return
@@ -270,7 +270,7 @@ async def mode_cmd(m: Message):
         return await m.reply("Usage: /mode video|document")
     global DEFAULT_UPLOAD_MODE
     DEFAULT_UPLOAD_MODE = parts[1]
-    await m.reply(f"Default upload mode set to: {html_escape(DEFAULT_UPLOAD_MODE)}")
+    await m.reply(f"Default upload mode set to: {DEFAULT_UPLOAD_MODE}")
 
 @router.message(Command("setmax"))
 async def setmax_cmd(m: Message):
@@ -290,7 +290,7 @@ async def status_cmd(m: Message):
     q = (
         f"Active jobs: {act} • Yours: {per}\n"
         f"Concurrent: {MAX_CONCURRENT} (per-user {PER_USER_CONCURRENT})\n"
-        f"Default mode: {html_escape(DEFAULT_UPLOAD_MODE)}\n"
+        f"Default mode: {DEFAULT_UPLOAD_MODE}\n"
         f"Max upload: {MAX_FILE_MB} MB\n"
         f"Daily quota: {QUOTA_DAILY_JOBS} jobs / {QUOTA_DAILY_MB} MB"
     )
@@ -359,12 +359,10 @@ async def handle_url(m: Message):
     if not is_allowed_user(uid):
         return await m.reply("You are not allowed to use this bot.")
 
-    # quota
     qreason = exceeds_quota(uid)
     if qreason:
-        return await m.reply(f"Quota exceeded: {html_escape(qreason)}")
+        return await m.reply(f"Quota exceeded: {qreason}")
 
-    # per-user concurrency
     if INFLIGHT_BY_USER.get(uid, 0) >= PER_USER_CONCURRENT:
         return await m.reply(f"Too many active downloads. Limit: {PER_USER_CONCURRENT}. Try again later.")
 
@@ -381,15 +379,14 @@ async def handle_url(m: Message):
         available_heights = sorted({f.get("height") for f in (info.get("formats") or [])
                                     if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
     except yt_dlp.utils.DownloadError as e:
-        tip = ""
         s = str(e)
+        tip = ""
         if "Sign in to confirm you're not a bot" in s or "account" in s.lower():
             tip = "\nTip: place a valid <code>cookies.txt</code> next to the bot."
         return await checking.edit_text(f"❌ Not downloadable / needs login / DRM.\n<code>{html_escape(s)}</code>{tip}")
     except Exception as e:
         return await checking.edit_text(f"❌ Failed to read the URL.\n<code>{html_escape(str(e))}</code>")
 
-    # Seed message we will keep editing
     prog = await m.reply("⏳ Starting… 0%")
 
     job_id = uuid.uuid4().hex[:8]
@@ -513,31 +510,46 @@ async def run_download(job: Job, token_override: Optional[str] = None):
             await edit(job, "⏬ Preparing…", throttle=0)
 
             loop = asyncio.get_running_loop()
-            progress_state = {"ts": 0}
+            progress_state = {"ts": 0, "started": False, "last_bytes": 0}
 
             def hook(d):
                 if job.cancel_flag:
                     raise yt_dlp.utils.DownloadError("Cancelled by user")
-                if d.get("status") == "downloading":
+                status = d.get("status")
+                if status == "downloading":
                     total = d.get("total_bytes") or d.get("total_bytes_estimate")
                     done = d.get("downloaded_bytes") or 0
                     speed = d.get("speed")
                     eta = d.get("eta")
+                    if done and not progress_state["started"]:
+                        progress_state["started"] = True
                     pct = (done / total * 100) if total else 0.0
+                    bar = _bar(pct)
                     line = (
-                        f"⏬ <b>Downloading…</b>\n"
+                        f"⏬ <b>Downloading…</b> {bar}\n"
                         f"{pct:.1f}%  ({fmt_bytes(done)} / {fmt_bytes(total)})\n"
                         f"Speed: {fmt_bytes(speed)}/s   ETA: {fmt_eta(eta)}"
                     )
                     now = time.time()
-                    if now - progress_state["ts"] > 1.2:
+                    if now - progress_state["ts"] > 1.0:
                         progress_state["ts"] = now
+                        progress_state["last_bytes"] = done
                         asyncio.run_coroutine_threadsafe(edit(job, line, throttle=0), loop)
-                elif d.get("status") == "finished":
+                elif status == "finished":
                     fn = d.get("filename")
                     if fn:
                         job.outfile = fn
                         asyncio.run_coroutine_threadsafe(edit(job, "✅ Download complete. Finalizing…", throttle=0), loop)
+
+            def _headers_for(url: str):
+                return {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"
+                    ),
+                    "Referer": url
+                }
 
             outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
             choice = token_to_format(token_override)
@@ -551,6 +563,12 @@ async def run_download(job: Job, token_override: Optional[str] = None):
                 "progress_hooks": [hook],
                 "merge_output_format": "mp4",
                 "restrictfilenames": False,
+                # robustness
+                "retries": 5,
+                "fragment_retries": 10,
+                "socket_timeout": 15,
+                "nocheckcertificate": True,
+                "http_headers": _headers_for(job.url),
             }
             if choice.get("extract_mp3"):
                 ydl_opts["postprocessors"] = [{
@@ -561,6 +579,20 @@ async def run_download(job: Job, token_override: Optional[str] = None):
             cookiefile = detect_cookiefile()
             if cookiefile:
                 ydl_opts["cookiefile"] = cookiefile
+
+            # Watchdog: if no progress after a while, warn user
+            async def watchdog():
+                # wait a bit for extractor to begin
+                await asyncio.sleep(15)
+                if not progress_state["started"]:
+                    await edit(job, "⏳ Still starting… (site may be slow). I’ll keep trying.", throttle=0)
+                # longer stall notice
+                await asyncio.sleep(30)
+                if not progress_state["started"]:
+                    note = "If this repeats, this site likely needs cookies/login."
+                    await edit(job, f"⚠️ No data yet. {note}", throttle=0)
+
+            asyncio.create_task(watchdog())
 
             def _go():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -585,7 +617,7 @@ async def run_download(job: Job, token_override: Optional[str] = None):
                         await edit(job, f"✅ Uploaded to S3:\n{html_escape(url)}", throttle=0)
                         return
                     else:
-                        await edit(job, "❌ S3 upload failed. Tap <b>Compress to Fit</b> or pull from server path.", throttle=0, show_compress=True)
+                        await edit(job, "❌ S3 upload failed. Tap <b>Compress to Fit</b> or fetch from server path.", throttle=0, show_compress=True)
                 else:
                     await edit(job,
                         f"✅ Downloaded: <code>{html_escape(os.path.basename(final_path))}</code>\n"
@@ -619,9 +651,15 @@ async def run_download(job: Job, token_override: Optional[str] = None):
         except Exception as e:
             await edit(job, f"❌ Error: <code>{html_escape(type(e).__name__ + ': ' + str(e))}</code>", throttle=0)
         finally:
+            # remove inflight counter; keep ACTIVE only if file exists (for compress/delete)
+            INFLIGHT_BY_USER[job.user_id] = max(0, INFLIGHT_BY_USER.get(job.user_id, 1) - 1)
             if not job.outfile or not os.path.exists(job.outfile):
                 ACTIVE.pop(job.job_id, None)
-            INFLIGHT_BY_USER[job.user_id] = max(0, INFLIGHT_BY_USER.get(job.user_id, 1) - 1)
+
+def _bar(pct: float, width: int = 18) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(width * pct / 100.0)
+    return "[" + ("#" * filled) + ("–" * (width - filled)) + "]"
 
 # ===================== Compress-to-fit & S3 =====================
 async def transcode_and_upload(job: Job):
@@ -629,7 +667,6 @@ async def transcode_and_upload(job: Job):
     if not src or not os.path.exists(src):
         return await edit(job, "❌ Missing source file.", throttle=0)
 
-    # bitrate target
     dur = ffprobe_duration(src) or 0
     target_bps = compute_bitrate_for_target(dur, MAX_FILE_MB - 5)
     dst = os.path.join(DOWNLOAD_DIR, f"{os.path.splitext(os.path.basename(src))[0]}.tgfit.mp4")
