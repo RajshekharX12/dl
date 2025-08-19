@@ -13,20 +13,16 @@ load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 import yt_dlp
 
-# utils.py from this repo
 from utils import fmt_bytes, fmt_eta, safe_filename, file_too_large, looks_like_video_ext
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
@@ -34,11 +30,10 @@ DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))
 DEFAULT_UPLOAD_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()
 
-# Whitelist is DISABLED on purpose: the bot will attempt ANY URL
+# Whitelist disabled: bot will attempt ANY URL
 ALLOWED_DOMAINS: List[str] = []
 
 assert BOT_TOKEN, "BOT_TOKEN is required in .env"
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
@@ -60,12 +55,11 @@ class Job:
     outfile: Optional[str] = None
     title: Optional[str] = None
 
-ACTIVE: Dict[str, Job] = {}     # job_id -> Job
-SELECTIONS: Dict[str, Dict[str, str]] = {}  # job_id -> token -> yt-dlp format string
+ACTIVE: Dict[str, Job] = {}
+SELECTIONS: Dict[str, Dict[str, str]] = {}
 
 def is_allowed_url(url: str) -> bool:
-    # Always allow: no domain gate
-    return True
+    return True  # no domain gate
 
 async def send_or_edit(bot: Bot, job: Job, text: str, kb=None, throttle=1.2):
     now = time.time()
@@ -73,21 +67,12 @@ async def send_or_edit(bot: Bot, job: Job, text: str, kb=None, throttle=1.2):
         return
     job.last_edit = now
     with suppress(Exception):
-        await bot.edit_message_text(
-            text, job.chat_id, job.msg_id,
-            reply_markup=kb, disable_web_page_preview=True
-        )
+        await bot.edit_message_text(text, job.chat_id, job.msg_id, reply_markup=kb)
 
 def formats_from_info(info: dict) -> List[dict]:
-    fmts = info.get("formats", []) or []
-    # Keep entries that have at least some info; allow HLS (unknown sizes)
-    return list(fmts)
+    return list(info.get("formats", []) or [])
 
 def pick_buttons(info: dict) -> Tuple[List[Tuple[str, str]], str]:
-    """
-    Return [(label, token)] and default format.
-    token -> symbolic key consumed by token_to_format().
-    """
     fmts = formats_from_info(info)
     heights = sorted({f.get("height") for f in fmts
                       if f.get("vcodec") not in (None, "none") and f.get("height")},
@@ -110,7 +95,6 @@ def pick_buttons(info: dict) -> Tuple[List[Tuple[str, str]], str]:
         if len(options) >= 6:
             break
 
-    # Add Best + Audio + MP3
     options = [("Best", "best")] + options + [("Audio-only (best)", "aud"), ("Audio MP3", "mp3")]
     default = "bv*+ba/b"
     return options, default
@@ -127,28 +111,28 @@ def token_to_format(token: str) -> dict:
         return {"format": f"bv*[height<={h}]+ba/b[height<={h}]"}
     return {"format": "bv*+ba/b"}
 
-def build_quality_kb(job_id: str, pairs: List[Tuple[str,str]], mode: str):
+def build_quality_kb(job_id: str, pairs: List[Tuple[str, str]], mode: str):
     kb = InlineKeyboardBuilder()
-    row = []
+    # add quality/format buttons, then arrange 2 per row
     for label, token in pairs:
         text = "✅ " + label if token == "best" else label
-        row.append(kb.button(text=text, callback_data=f"sel:{job_id}:{token}"))
-        if len(row) == 2:
-            kb.row(*row); row = []
-    if row:
-        kb.row(*row)
+        kb.add(InlineKeyboardButton(text=text, callback_data=f"sel:{job_id}:{token}"))
+    kb.adjust(2)
+    # upload mode toggle
     kb.row(
-        kb.button(text="⬆️ Upload as Video", callback_data=f"mode:{job_id}:video"),
-        kb.button(text="📄 Upload as Document", callback_data=f"mode:{job_id}:document"),
+        InlineKeyboardButton(text="⬆️ Upload as Video", callback_data=f"mode:{job_id}:video"),
+        InlineKeyboardButton(text="📄 Upload as Document", callback_data=f"mode:{job_id}:document"),
     )
-    kb.row(kb.button(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
+    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
     return kb.as_markup()
 
 def build_cancel_kb(job_id: str, mode: str):
     kb = InlineKeyboardBuilder()
-    kb.row(kb.button(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
-    kb.row(kb.button(text=("⬆️ As Video" if mode == "video" else "📄 As Document"),
-                     callback_data=f"mode:{job_id}:{mode}"))
+    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
+    kb.row(InlineKeyboardButton(
+        text=("⬆️ As Video" if mode == "video" else "📄 As Document"),
+        callback_data=f"mode:{job_id}:{mode}"
+    ))
     return kb.as_markup()
 
 @router.message(Command("start"))
@@ -158,8 +142,7 @@ async def start(m: Message):
         "• probe formats & show buttons (1080p/720p/…/audio/MP3)\n"
         "• download with live progress + ETA\n"
         "• upload to Telegram as video/document (toggle)\n\n"
-        "Legal: Only download content you own or have permission to. No DRM/paywalls/logins.",
-        disable_web_page_preview=True
+        "Legal: Only download content you own or have permission to. No DRM/paywalls/logins."
     )
 
 @router.message(Command("help"))
@@ -175,7 +158,6 @@ async def handle_url(m: Message):
 
     probe_msg = await m.reply("🔎 Probing formats…")
 
-    # Extract info without downloading
     try:
         ydl_opts = {
             "skip_download": True,
@@ -244,8 +226,7 @@ async def selected_format(cq: CallbackQuery, bot: Bot):
     asyncio.create_task(run_download(bot, job, extract_mp3=extract_mp3))
 
 async def run_download(bot: Bot, job: Job, extract_mp3: bool = False):
-    await send_or_edit(bot, job, "⏬ Preparing download…",
-                       build_cancel_kb(job.job_id, job.upload_mode), throttle=0)
+    await send_or_edit(bot, job, "⏬ Preparing download…", build_cancel_kb(job.job_id, job.upload_mode), throttle=0)
 
     loop = asyncio.get_running_loop()
     progress_state = {"last_update": 0}
@@ -274,14 +255,12 @@ async def run_download(bot: Bot, job: Job, extract_mp3: bool = False):
                     send_or_edit(bot, job, line, build_cancel_kb(job.job_id, job.upload_mode), throttle=0),
                     loop
                 )
-
         elif status == "finished":
             fn = d.get("filename")
             if fn:
                 job.outfile = fn
                 asyncio.run_coroutine_threadsafe(
-                    send_or_edit(bot, job, "✅ Download complete. Finalizing…",
-                                 build_cancel_kb(job.job_id, job.upload_mode), throttle=0),
+                    send_or_edit(bot, job, "✅ Download complete. Finalizing…", build_cancel_kb(job.job_id, job.upload_mode), throttle=0),
                     loop
                 )
 
