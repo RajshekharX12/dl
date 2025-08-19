@@ -3,7 +3,6 @@ import os
 import re
 import time
 import uuid
-import subprocess
 from contextlib import suppress
 from typing import Optional, Dict, List
 
@@ -25,7 +24,7 @@ if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN in .env")
 
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # stay under Telegram cap
+MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # keep under Telegram caps
 DEFAULT_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()  # video|document
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -82,6 +81,13 @@ def bar(pct: float, width: int = 18) -> str:
     fill = int(width * pct / 100.0)
     return "[" + "#" * fill + "–" * (width - fill) + "]"
 
+# ====== safe scheduling from yt-dlp threads ======
+def schedule_edit(loop: asyncio.AbstractEventLoop, message: Message, text: str, reply_markup=None):
+    async def _edit():
+        with suppress(Exception):
+            await message.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    asyncio.run_coroutine_threadsafe(_edit(), loop)
+
 # ========= keyboards =========
 def kb_format_choices(job_id: str, heights: List[int]):
     kb = InlineKeyboardBuilder()
@@ -105,7 +111,7 @@ async def start_cmd(m: Message):
     await m.reply(
         "Send a video/page URL.\n"
         "I’ll probe formats → you choose quality → I download with live <b>% / speed / ETA</b> and send it.\n"
-        "<i>Tip: For age/consent-gated sites (e.g., YouTube), place a Netscape <code>cookies.txt</code> file next to the bot.</i>",
+        "<i>Tip: For age/consent-gated sites (e.g., YouTube), put a Netscape <code>cookies.txt</code> beside the bot.</i>",
         parse_mode="HTML"
     )
 
@@ -135,13 +141,7 @@ async def on_url(m: Message):
     heights = {f.get("height") for f in fmts if f.get("vcodec") not in (None, "none")}
 
     job_id = uuid.uuid4().hex[:8]
-    JOBS[job_id] = {
-        "url": url,
-        "title": title,
-        "msg": msg,
-        "mode": DEFAULT_MODE,
-        "cancelled": False
-    }
+    JOBS[job_id] = {"url": url, "title": title, "msg": msg, "mode": DEFAULT_MODE, "cancelled": False}
 
     await msg.edit_text(
         f"🎬 <b>{esc(title)}</b>\nChoose a format:",
@@ -184,7 +184,6 @@ async def cb_get(cq: CallbackQuery):
     msg = job["msg"]
     title = job["title"]
     await cq.answer("Downloading…")
-
     await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…", reply_markup=kb_cancel(job_id), parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
@@ -210,16 +209,10 @@ async def cb_get(cq: CallbackQuery):
                     f"{bar(pct)}  {pct:.1f}%\n"
                     f"{fmt_bytes(done)} / {fmt_bytes(total)} • {fmt_bytes(spd)}/s • ETA {fmt_eta(eta)}"
                 )
-                asyncio.run_coroutine_threadsafe(
-                    msg.edit_text(text, reply_markup=kb_cancel(job_id), parse_mode="HTML"),
-                    loop
-                )
+                schedule_edit(loop, msg, text, reply_markup=kb_cancel(job_id))
         elif st == "finished":
             started["file"] = d.get("filename")
-            asyncio.run_coroutine_threadsafe(
-                msg.edit_text("✅ Download complete. Finalizing…", reply_markup=kb_cancel(job_id)),
-                loop
-            )
+            schedule_edit(loop, msg, "✅ Download complete. Finalizing…", reply_markup=kb_cancel(job_id))
 
     choice = token_to_format(token)
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
@@ -316,7 +309,9 @@ async def cb_get(cq: CallbackQuery):
 async def main():
     global g_bot
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await dp.start_polling(g_bot)
+    # Avoid conflicts with any previous webhook
+    await g_bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(g_bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
