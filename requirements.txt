@@ -1,0 +1,4 @@
+aiogram==3.13.1
+yt-dlp>=2024.10.22
+python-dotenv>=1.0.1
+aiofiles>=24.1.0
