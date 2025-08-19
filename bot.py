@@ -20,10 +20,11 @@ from aiogram.client.default import DefaultBotProperties
 import yt_dlp
 import requests
 
-# ===================== Config =====================
+# =============== Config ===============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN in .env")
+
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))
 DEFAULT_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()  # video|document
@@ -31,7 +32,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-# ===================== Aiogram =====================
+# =============== Aiogram ===============
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -39,7 +40,7 @@ g_bot: Optional[Bot] = None
 
 JOBS: Dict[str, dict] = {}
 
-# ===================== Helpers =====================
+# =============== Helpers ===============
 def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -99,16 +100,12 @@ def common_headers(url: str) -> dict:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-def http_get(url: str) -> str:
-    # NOTE: some hosts need Referer=self and relaxed SSL; adjust if needed
+def http_get_text(url: str) -> str:
     r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
 def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
-    """
-    Return (m3u8_urls, mp4_urls) discovered in the HTML via common patterns.
-    """
     m3u8 = set()
     mp4 = set()
 
@@ -124,7 +121,7 @@ def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
         if ".m3u8" in u: m3u8.add(u)
         if ".mp4" in u: mp4.add(u)
 
-    # plain .m3u8 or .mp4
+    # plain .m3u8/.mp4 in text
     for m in re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html, re.I):
         m3u8.add(m)
     for m in re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html, re.I):
@@ -133,7 +130,6 @@ def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     return list(m3u8), list(mp4)
 
 def m3u8_heights(m3u8_text: str) -> List[int]:
-    # Parse #EXT-X-STREAM-INF lines for RESOLUTION=WxH
     hs = set()
     for line in m3u8_text.splitlines():
         m = re.search(r"RESOLUTION=\s*\d+x(\d+)", line)
@@ -171,7 +167,11 @@ def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
         except Exception as e2:
             return None, False, f"{type(e2).__name__}: {e2}"
 
-# ===================== Keyboards =====================
+def is_cf_block(err_text: str) -> bool:
+    t = err_text.lower()
+    return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
+
+# =============== Keyboards ===============
 def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True):
     kb = InlineKeyboardBuilder()
     if include_best:
@@ -183,13 +183,13 @@ def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True
     kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
     return kb.as_markup()
 
-# ===================== Commands =====================
+# =============== Commands ===============
 @router.message(Command("start"))
 async def start_cmd(m: Message):
     await m.reply(
         "Send a video/page URL.\n"
-        "I show the real qualities (Best, 1080p, 720p, …) ➜ download with live <b>% / speed / ETA</b> ➜ send the file.\n"
-        "<i>For some sites, a Netscape <code>cookies.txt</code> may be required (age/consent/anti-bot).</i>",
+        "I show real qualities (Best, 1080p, 720p, …) → download with live <b>% / speed / ETA</b> → send the file.\n"
+        "<i>Some sites require login/consent or block bots. For authorized access, add a Netscape <code>cookies.txt</code> next to the bot.</i>",
         parse_mode="HTML"
     )
 
@@ -197,34 +197,32 @@ async def start_cmd(m: Message):
 async def help_cmd(m: Message):
     await start_cmd(m)
 
-# ===================== URL handler =====================
+# =============== URL handler ===============
 @router.message(F.text.regexp(URL_RE))
 async def on_url(m: Message):
     url = URL_RE.search(m.text).group(1)
     msg = await m.reply("🔎 Checking…")
 
-    # 1) yt-dlp probe (normal -> generic)
-    info, used_generic, err = probe_info(url)
-    heights: List[int] = []
     job_id = uuid.uuid4().hex[:8]
     job = {"url": url, "title": host_title(url), "msg": msg, "cancelled": False,
            "dl_url": None, "dl_is_direct": False}
     JOBS[job_id] = job
 
+    # 1) yt-dlp probe (native -> generic)
+    info, used_generic, err = probe_info(url)
     if info:
-        fmts = info.get("formats") or []
-        for f in fmts:
+        heights: List[int] = []
+        for f in info.get("formats") or []:
             if f.get("vcodec") in (None, "none"):
                 continue
             h = f.get("height")
             if isinstance(h, int) and h > 0:
                 heights.append(h)
             else:
-                # fallback parse
                 res = f.get("resolution") or f.get("format_note") or ""
-                mres = re.search(r"(\d+)\s*p", res)
-                if mres:
-                    heights.append(int(mres.group(1)))
+                mh = re.search(r"(\d+)\s*p", res)
+                if mh:
+                    heights.append(int(mh.group(1)))
         job["title"] = info.get("title") or job["title"]
         suffix = " (generic)" if used_generic else ""
         await msg.edit_text(
@@ -235,81 +233,52 @@ async def on_url(m: Message):
         return
 
     # 2) Direct-media fallback (HTML scan)
+    heights_fallback: List[int] = []
+    note = ""
+    if err and is_cf_block(err):
+        note = "\n<i>Site is protected by anti-bot. I can’t help bypass that. "
+        note += "If you have access, export your session as <code>cookies.txt</code> and try again, or paste a direct .mp4/.m3u8 link.</i>"
+    elif err:
+        note = f"\n<i>Extractor failed ({esc(err)}). We can still try a generic attempt.</i>"
+
     html = None
     try:
-        html = http_get(url)
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        html = http_get_text(url)
+    except Exception:
+        html = None
 
-    m3u8s, mp4s = ([], [])
     if html:
         m3u8s, mp4s = find_direct_media(html, url)
+        if m3u8s:
+            m3u8_url = m3u8s[0]
+            mtxt = fetch_text(m3u8_url) or ""
+            heights_fallback = m3u8_heights(mtxt) or [1080, 720, 480, 360]
+            job["dl_url"] = m3u8_url
+            job["dl_is_direct"] = True
+            await msg.edit_text(
+                f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found){note}\nChoose a quality:",
+                reply_markup=kb_format_choices(job_id, heights_fallback),
+                parse_mode="HTML"
+            )
+            return
+        if mp4s:
+            job["dl_url"] = mp4s[0]
+            job["dl_is_direct"] = True
+            await msg.edit_text(
+                f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found){note}\nChoose:",
+                reply_markup=kb_format_choices(job_id, [], include_best=True),
+                parse_mode="HTML"
+            )
+            return
 
-    if m3u8s:
-        # Prefer the first master m3u8
-        m3u8_url = m3u8s[0]
-        # Try to fetch it and parse qualities
-        mtxt = fetch_text(m3u8_url) or ""
-        hts = m3u8_heights(mtxt)
-        job["dl_url"] = m3u8_url
-        job["dl_is_direct"] = True  # direct URL; but yt-dlp can still handle it
-        await msg.edit_text(
-            f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found)\nChoose a quality:",
-            reply_markup=kb_format_choices(job_id, hts or [1080, 720, 480, 360]),
-            parse_mode="HTML"
-        )
-        return
-
-    if mp4s:
-        job["dl_url"] = mp4s[0]
-        job["dl_is_direct"] = True
-        await msg.edit_text(
-            f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found)\nChoose:",
-            reply_markup=kb_format_choices(job_id, [], include_best=True),
-            parse_mode="HTML"
-        )
-        return
-
-    # 3) As a last try: known embed hosts (e.g., vk/ok)
-    if html:
-        # Look for embedded VK/OK links
-        embeds = re.findall(r'https?://(?:vk\.com|ok\.ru)/[^"\']+', html, re.I)
-        if embeds:
-            emb = embeds[0]
-            info2, used_generic2, err2 = probe_info(emb)
-            if info2:
-                fmts = info2.get("formats") or []
-                for f in fmts:
-                    if f.get("vcodec") in (None, "none"):
-                        continue
-                    h = f.get("height")
-                    if isinstance(h, int) and h > 0:
-                        heights.append(h)
-                job["url"] = emb  # switch to the real embed URL
-                job["title"] = info2.get("title") or job["title"]
-                suffix = " (embed)"
-                await msg.edit_text(
-                    f"🎬 <b>{esc(job['title'])}</b>{esc(suffix)}\nChoose a quality:",
-                    reply_markup=kb_format_choices(job_id, heights or []),
-                    parse_mode="HTML"
-                )
-                return
-
-    # If we reached here, we couldn't prove formats. Still offer generic attempt.
-    note = ""
-    if err:
-        e = err.lower()
-        if any(w in e for w in ("sign in", "login", "account")):
-            note = "\n<i>Site may require login; you can add a <code>cookies.txt</code>.</i>"
-        else:
-            note = "\n<i>Extractor failed; we can still try a generic download.</i>"
+    # 3) No formats discovered → generic try menu
     await msg.edit_text(
         f"🎬 <b>{esc(job['title'])}</b>\nCouldn’t list qualities.{note}\nPick one to try:",
         reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360]),
         parse_mode="HTML"
     )
 
-# ===================== Callbacks =====================
+# =============== Callbacks ===============
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(cq: CallbackQuery):
     _, job_id = cq.data.split(":")
@@ -341,7 +310,9 @@ async def cb_get(cq: CallbackQuery):
     msg = job["msg"]
 
     await cq.answer("Downloading…")
-    await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…", reply_markup=kb_format_choices(job_id, [], include_best=False), parse_mode="HTML")
+    await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…",
+                        reply_markup=kb_format_choices(job_id, [], include_best=False),
+                        parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
     started = {"flag": False, "ts": 0, "file": None}
@@ -395,7 +366,6 @@ async def cb_get(cq: CallbackQuery):
             opts["cookiefile"] = cookiefile
         if force_generic:
             opts["force_generic_extractor"] = True
-        # If we already discovered a direct media URL, keep headers; yt-dlp can still handle m3u8/mp4
         return opts
 
     def run_dl_with_fallback():
@@ -413,15 +383,20 @@ async def cb_get(cq: CallbackQuery):
     except yt_dlp.utils.DownloadError as e:
         s = str(e)
         tip = ""
-        if any(w in s.lower() for w in ("sign in", "login", "account")):
-            tip = "\nTip: add a valid <code>cookies.txt</code>."
+        if is_cf_block(s):
+            tip = ("\n<i>This site is using anti-bot protection. I can’t help bypass that. "
+                   "If you have access, export cookies as <code>cookies.txt</code> or paste a direct .mp4/.m3u8.</i>")
+        elif any(w in s.lower() for w in ("sign in", "login", "account")):
+            tip = "\n<i>Login required. Add a valid <code>cookies.txt</code>.</i>"
         with suppress(Exception):
-            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}",
+                                parse_mode="HTML", reply_markup=None)
         JOBS.pop(job_id, None)
         return
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>",
+                                parse_mode="HTML", reply_markup=None)
         JOBS.pop(job_id, None)
         return
 
@@ -465,7 +440,7 @@ async def cb_get(cq: CallbackQuery):
         await msg.delete()
     JOBS.pop(job_id, None)
 
-# ===================== Runner =====================
+# =============== Runner ===============
 async def main():
     global g_bot
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
