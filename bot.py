@@ -23,16 +23,16 @@ from aiogram.client.default import DefaultBotProperties
 
 import yt_dlp
 
-# ---- Optional S3 (only used if enabled) ----
+# ---------- Optional S3 ----------
 try:
-    import boto3  # pip install boto3
+    import boto3
     from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-except Exception:  # keep the code running without S3
+except Exception:
     boto3 = None
     BotoCoreError = ClientError = NoCredentialsError = Exception
+# ---------------------------------
 
 # ===================== Config =====================
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -41,7 +41,7 @@ if not BOT_TOKEN:
 
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # platform-safe cap for bots
+MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))  # stay safely below Telegram bot cap
 DEFAULT_UPLOAD_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()
 
 # Quotas / limits
@@ -50,7 +50,7 @@ PER_USER_CONCURRENT = int(os.environ.get("PER_USER_CONCURRENT", "2"))       # pe
 QUOTA_DAILY_JOBS = int(os.environ.get("QUOTA_DAILY_JOBS", "50"))            # per-user jobs/day
 QUOTA_DAILY_MB = int(os.environ.get("QUOTA_DAILY_MB", "8000"))              # per-user MB/day (~8GB)
 
-# Allowlist: if non-empty, ONLY these IDs can use the bot
+# Allow/ban
 ALLOWLIST_IDS = [int(x) for x in os.environ.get("ALLOWLIST_IDS", "").split(",") if x.strip().isdigit()]
 BANLIST_IDS = [int(x) for x in os.environ.get("BANLIST_IDS", "").split(",") if x.strip().isdigit()]
 
@@ -68,8 +68,7 @@ ALLOW_FILE = os.path.join(STATE_DIR, "allow.json")
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-# ===================== Small helpers =====================
-
+# ===================== Helpers =====================
 def fmt_bytes(n: Optional[float]) -> str:
     if n is None:
         return "?"
@@ -139,15 +138,16 @@ def ffprobe_duration(path: str) -> Optional[float]:
         return None
 
 def compute_bitrate_for_target(duration_sec: float, target_mb: int) -> int:
-    # reserve ~128k for audio
     if duration_sec <= 0:
         return 2_000_000
     target_bytes = target_mb * 1024 * 1024
     total_bps = int((target_bytes * 8) / duration_sec)
-    return max(300_000, total_bps - 128_000)
+    return max(300_000, total_bps - 128_000)  # reserve ~128k for audio
 
-# ===================== State & models =====================
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+# ===================== State =====================
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -169,13 +169,10 @@ class Job:
 
 ACTIVE: Dict[str, Job] = {}
 SEM = asyncio.Semaphore(MAX_CONCURRENT)
-
-# per-user in-flight counters
 INFLIGHT_BY_USER: Dict[int, int] = {}
 
-# Quotas persisted by day
-QUOTAS = load_json(QUOTA_FILE, {})        # { date: { user_id: {"jobs": int, "mb": int} } }
-ALLOWSTATE = load_json(ALLOW_FILE, {      # {"allow": [...], "ban":[...]}
+QUOTAS = load_json(QUOTA_FILE, {})
+ALLOWSTATE = load_json(ALLOW_FILE, {
     "allow": ALLOWLIST_IDS,
     "ban": BANLIST_IDS
 })
@@ -205,21 +202,17 @@ def exceeds_quota(uid: int) -> Optional[str]:
     return None
 
 # ===================== Keyboards =====================
-
 def kb_progress(job: Job, show_compress: bool = False):
     kb = InlineKeyboardBuilder()
-    # first row: cancel + retry
     kb.row(
         InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job.job_id}"),
         InlineKeyboardButton(text="🔁 Retry", callback_data=f"retry:{job.job_id}")
     )
-    # formats & audio options
     kb.row(
         InlineKeyboardButton(text="🎛️ Formats", callback_data=f"formats:{job.job_id}"),
         InlineKeyboardButton(text="🎵 Audio", callback_data=f"fmt:{job.job_id}:aud"),
         InlineKeyboardButton(text="🎵 MP3", callback_data=f"fmt:{job.job_id}:mp3")
     )
-    # upload mode toggles (show current with checkmark)
     vid_text = "✅ As Video" if job.upload_mode == "video" else "As Video"
     doc_text = "✅ As Document" if job.upload_mode == "document" else "As Document"
     kb.row(
@@ -241,8 +234,7 @@ def kb_formats(job_id: str, heights: List[int]):
     kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=f"back:{job_id}"))
     return kb.as_markup()
 
-# ===================== Editing helper =====================
-
+# ===================== Edit helper =====================
 async def edit(job: Job, text: str, *, throttle: float = 1.1, show_compress: bool = False):
     now = time.time()
     if now - job.last_edit < throttle:
@@ -255,16 +247,14 @@ async def edit(job: Job, text: str, *, throttle: float = 1.1, show_compress: boo
         )
 
 # ===================== Commands =====================
-
 @router.message(Command("start"))
 async def start_cmd(m: Message):
     await m.reply(
-        "Drop a video/page URL – I start **immediately**.\n"
-        "Live progress: **% / speed / ETA** in one message.\n"
+        "Drop a video/page URL – I start <b>immediately</b>.\n"
+        "Live progress: <b>% / speed / ETA</b> in one message.\n"
         "Buttons: Cancel • Retry • Formats • Audio • MP3 • Upload mode • Compress • Delete.\n\n"
-        "Admin: /status, /mode video|document, /setmax <MB>, /cleanup <days>, /allow <id>, /deny <id>, /allowlist\n"
-        "Use legally. No DRM/paywalls/logins are bypassed.",
-        parse_mode="HTML"
+        "Admin: /status, /mode video|document, /setmax &lt;MB&gt;, /cleanup &lt;days&gt;, /allow &lt;id&gt;, /deny &lt;id&gt;, /allowlist\n"
+        "Use legally. No DRM/paywalls/logins are bypassed."
     )
 
 @router.message(Command("help"))
@@ -280,7 +270,7 @@ async def mode_cmd(m: Message):
         return await m.reply("Usage: /mode video|document")
     global DEFAULT_UPLOAD_MODE
     DEFAULT_UPLOAD_MODE = parts[1]
-    await m.reply(f"Default upload mode set to: {DEFAULT_UPLOAD_MODE}")
+    await m.reply(f"Default upload mode set to: {html_escape(DEFAULT_UPLOAD_MODE)}")
 
 @router.message(Command("setmax"))
 async def setmax_cmd(m: Message):
@@ -288,7 +278,7 @@ async def setmax_cmd(m: Message):
         return await m.reply("Only owner can change max size.")
     parts = m.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        return await m.reply("Usage: /setmax <MB>")
+        return await m.reply("Usage: /setmax &lt;MB&gt;")
     global MAX_FILE_MB
     MAX_FILE_MB = int(parts[1])
     await m.reply(f"Max upload size set to {MAX_FILE_MB} MB")
@@ -297,7 +287,13 @@ async def setmax_cmd(m: Message):
 async def status_cmd(m: Message):
     act = len(ACTIVE)
     per = INFLIGHT_BY_USER.get(m.from_user.id if m.from_user else 0, 0)
-    q = f"Active jobs: {act} • Yours: {per}\nConcurrent: {MAX_CONCURRENT} (per-user {PER_USER_CONCURRENT})\nDefault mode: {DEFAULT_UPLOAD_MODE}\nMax upload: {MAX_FILE_MB} MB\nDaily quota: {QUOTA_DAILY_JOBS} jobs / {QUOTA_DAILY_MB} MB"
+    q = (
+        f"Active jobs: {act} • Yours: {per}\n"
+        f"Concurrent: {MAX_CONCURRENT} (per-user {PER_USER_CONCURRENT})\n"
+        f"Default mode: {html_escape(DEFAULT_UPLOAD_MODE)}\n"
+        f"Max upload: {MAX_FILE_MB} MB\n"
+        f"Daily quota: {QUOTA_DAILY_JOBS} jobs / {QUOTA_DAILY_MB} MB"
+    )
     await m.reply(q)
 
 @router.message(Command("cleanup"))
@@ -324,7 +320,7 @@ async def allow_cmd(m: Message):
         return await m.reply("Owner only.")
     parts = m.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        return await m.reply("Usage: /allow <user_id>")
+        return await m.reply("Usage: /allow &lt;user_id&gt;")
     uid = int(parts[1])
     allow = set(ALLOWSTATE.get("allow", []))
     allow.add(uid)
@@ -338,11 +334,11 @@ async def deny_cmd(m: Message):
         return await m.reply("Owner only.")
     parts = m.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        return await m.reply("Usage: /deny <user_id>")
+        return await m.reply("Usage: /deny &lt;user_id&gt;")
     uid = int(parts[1])
     allow = set(ALLOWSTATE.get("allow", []))
     ban = set(ALLOWSTATE.get("ban", []))
-    if uid in allow: allow.remove(uid)
+    allow.discard(uid)
     ban.add(uid)
     ALLOWSTATE["allow"] = sorted(list(allow))
     ALLOWSTATE["ban"] = sorted(list(ban))
@@ -356,7 +352,6 @@ async def allowlist_cmd(m: Message):
     await m.reply(f"Allow: {allow or 'everyone'}\nBan: {ban or '—'}")
 
 # ===================== URL handling =====================
-
 @router.message(F.text.regexp(URL_RE))
 async def handle_url(m: Message):
     uid = m.from_user.id if m.from_user else 0
@@ -367,24 +362,46 @@ async def handle_url(m: Message):
     # quota
     qreason = exceeds_quota(uid)
     if qreason:
-        return await m.reply(f"Quota exceeded: {qreason}")
+        return await m.reply(f"Quota exceeded: {html_escape(qreason)}")
 
     # per-user concurrency
     if INFLIGHT_BY_USER.get(uid, 0) >= PER_USER_CONCURRENT:
         return await m.reply(f"Too many active downloads. Limit: {PER_USER_CONCURRENT}. Try again later.")
 
     url = URL_RE.search(m.text).group(1).strip()
+
+    # Pre-check (tell user if downloadable before starting)
+    checking = await m.reply("🔎 Checking URL…")
+    try:
+        with yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        title = info.get("title") or "video"
+        extractor = info.get("extractor") or "unknown"
+        await checking.edit_text(f"✅ Looks downloadable via <code>{html_escape(extractor)}</code>\n<b>{html_escape(title)}</b>\nStarting…")
+        available_heights = sorted({f.get("height") for f in (info.get("formats") or [])
+                                    if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
+    except yt_dlp.utils.DownloadError as e:
+        tip = ""
+        s = str(e)
+        if "Sign in to confirm you're not a bot" in s or "account" in s.lower():
+            tip = "\nTip: place a valid <code>cookies.txt</code> next to the bot."
+        return await checking.edit_text(f"❌ Not downloadable / needs login / DRM.\n<code>{html_escape(s)}</code>{tip}")
+    except Exception as e:
+        return await checking.edit_text(f"❌ Failed to read the URL.\n<code>{html_escape(str(e))}</code>")
+
+    # Seed message we will keep editing
     prog = await m.reply("⏳ Starting… 0%")
 
     job_id = uuid.uuid4().hex[:8]
     job = Job(job_id=job_id, user_id=uid, url=url, chat_id=prog.chat.id, msg_id=prog.message_id)
+    job.title = title
+    job.available_heights = available_heights
     ACTIVE[job_id] = job
     INFLIGHT_BY_USER[uid] = INFLIGHT_BY_USER.get(uid, 0) + 1
 
     asyncio.create_task(run_download(job))
 
 # ===================== Callback handlers =====================
-
 @router.callback_query(F.data.startswith("setmode:"))
 async def cb_setmode(cq: CallbackQuery):
     _, job_id, mode = cq.data.split(":")
@@ -475,10 +492,9 @@ async def cb_rm(cq: CallbackQuery):
         await edit(job, "🧹 File deleted.", throttle=0)
     except Exception as e:
         await cq.answer("Delete failed.", show_alert=True)
-        await edit(job, f"❌ Delete failed: <code>{e}</code>", throttle=0)
+        await edit(job, f"❌ Delete failed: <code>{html_escape(str(e))}</code>", throttle=0)
 
 # ===================== Download core =====================
-
 def token_to_format(token: Optional[str]) -> dict:
     if not token or token == "best":
         return {"format": "bv*+ba/b"}
@@ -495,16 +511,6 @@ async def run_download(job: Job, token_override: Optional[str] = None):
     async with SEM:
         try:
             await edit(job, "⏬ Preparing…", throttle=0)
-
-            # Quick probe for title & formats (best-effort)
-            try:
-                with yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True}) as ydl:
-                    info = ydl.extract_info(job.url, download=False)
-                    job.title = info.get("title") or "video"
-                    job.available_heights = sorted({f.get("height") for f in (info.get("formats") or []) if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
-                    await edit(job, f"🎬 <b>{job.title}</b>\nStarting…", throttle=0)
-            except Exception:
-                pass
 
             loop = asyncio.get_running_loop()
             progress_state = {"ts": 0}
@@ -570,30 +576,27 @@ async def run_download(job: Job, token_override: Optional[str] = None):
             size_bytes = os.path.getsize(final_path)
             add_quota(job.user_id, size_bytes)
 
-            # Upload or next steps
             if file_too_large(final_path, MAX_FILE_MB):
                 # Try S3 if enabled
                 if S3_ENABLE and boto3 and S3_BUCKET:
                     await edit(job, "📤 Uploading to S3 (file too large for Telegram)…", throttle=0)
                     url = await s3_upload_with_progress(job, final_path)
                     if url:
-                        await edit(job, f"✅ Uploaded to S3:\n{url}", throttle=0)
-                        # Keep job in ACTIVE so buttons still work (delete/compress if desired)
+                        await edit(job, f"✅ Uploaded to S3:\n{html_escape(url)}", throttle=0)
                         return
                     else:
-                        await edit(job, "❌ S3 upload failed. You can tap 'Compress to Fit' or fetch from server path.", throttle=0, show_compress=True)
+                        await edit(job, "❌ S3 upload failed. Tap <b>Compress to Fit</b> or pull from server path.", throttle=0, show_compress=True)
                 else:
                     await edit(job,
-                        f"✅ Downloaded: <code>{os.path.basename(final_path)}</code>\n"
+                        f"✅ Downloaded: <code>{html_escape(os.path.basename(final_path))}</code>\n"
                         f"Size: {fmt_bytes(size_bytes)}\n\n"
-                        f"⚠️ Too large for Telegram (>{MAX_FILE_MB} MB).\n"
-                        f"Tap <b>Compress to Fit</b> to transcode & upload, or pull from server:\n"
-                        f"<code>{final_path}</code>",
+                        f"⚠️ Too large for Telegram (&gt;{MAX_FILE_MB} MB).\n"
+                        f"Tap <b>Compress to Fit</b> to transcode &amp; upload, or fetch from server:\n"
+                        f"<code>{html_escape(final_path)}</code>",
                         throttle=0, show_compress=True
                     )
                 return
 
-            # Upload to Telegram
             caption = "✅ Done."
             ext = os.path.splitext(final_path)[1][1:].lower()
             with suppress(Exception):
@@ -608,28 +611,27 @@ async def run_download(job: Job, token_override: Optional[str] = None):
                 await g_bot.delete_message(job.chat_id, job.msg_id)
 
         except yt_dlp.utils.DownloadError as e:
-            tip = ""
             s = str(e)
+            tip = ""
             if "Sign in to confirm you're not a bot" in s or "account" in s.lower():
                 tip = "\nTip: put a valid <code>cookies.txt</code> next to the bot."
-            await edit(job, f"❌ Download error.\n<code>{e}</code>{tip}", throttle=0)
+            await edit(job, f"❌ Download error.\n<code>{html_escape(s)}</code>{tip}", throttle=0)
         except Exception as e:
-            await edit(job, f"❌ Error: <code>{type(e).__name__}: {e}</code>", throttle=0)
+            await edit(job, f"❌ Error: <code>{html_escape(type(e).__name__ + ': ' + str(e))}</code>", throttle=0)
         finally:
-            # Keep ACTIVE if file exists (for compress/delete); otherwise remove
             if not job.outfile or not os.path.exists(job.outfile):
                 ACTIVE.pop(job.job_id, None)
             INFLIGHT_BY_USER[job.user_id] = max(0, INFLIGHT_BY_USER.get(job.user_id, 1) - 1)
 
 # ===================== Compress-to-fit & S3 =====================
-
 async def transcode_and_upload(job: Job):
     src = job.outfile
     if not src or not os.path.exists(src):
         return await edit(job, "❌ Missing source file.", throttle=0)
 
+    # bitrate target
     dur = ffprobe_duration(src) or 0
-    target_bps = compute_bitrate_for_target(dur, MAX_FILE_MB - 5)  # safety margin
+    target_bps = compute_bitrate_for_target(dur, MAX_FILE_MB - 5)
     dst = os.path.join(DOWNLOAD_DIR, f"{os.path.splitext(os.path.basename(src))[0]}.tgfit.mp4")
 
     await edit(job, "🗜️ Compressing to fit…", throttle=0)
@@ -643,10 +645,10 @@ async def transcode_and_upload(job: Job):
     try:
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     except Exception as e:
-        return await edit(job, f"❌ Compress failed: <code>{e}</code>", throttle=0)
+        return await edit(job, f"❌ Compress failed: <code>{html_escape(str(e))}</code>", throttle=0)
 
     if file_too_large(dst, MAX_FILE_MB):
-        return await edit(job, "❌ Still too large after compress. Choose lower format via Formats.", throttle=0)
+        return await edit(job, "❌ Still too large after compress. Use Formats to pick a lower height.", throttle=0)
 
     await edit(job, "⬆️ Uploading compressed file…", throttle=0)
     with open(dst, "rb") as f:
@@ -681,14 +683,13 @@ async def s3_upload_with_progress(job: Job, file_path: str) -> Optional[str]:
         )
         return url
     except (BotoCoreError, ClientError, NoCredentialsError) as e:
-        await edit(job, f"❌ S3 error: <code>{e}</code>", throttle=0)
+        await edit(job, f"❌ S3 error: <code>{html_escape(str(e))}</code>", throttle=0)
         return None
     except Exception as e:
-        await edit(job, f"❌ S3 error: <code>{e}</code>", throttle=0)
+        await edit(job, f"❌ S3 error: <code>{html_escape(str(e))}</code>", throttle=0)
         return None
 
 # ===================== Runner =====================
-
 async def main():
     global g_bot
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
