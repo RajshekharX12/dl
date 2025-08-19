@@ -5,6 +5,7 @@ import time
 import uuid
 from contextlib import suppress
 from typing import Optional, Dict, List, Tuple
+from urllib.parse import urlparse, urljoin
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,12 +18,12 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 import yt_dlp
+import requests
 
-# ===================== Config (minimal) =====================
+# ===================== Config =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN in .env")
-
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))
 DEFAULT_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()  # video|document
@@ -30,13 +31,12 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-# ===================== Aiogram wiring =====================
+# ===================== Aiogram =====================
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 g_bot: Optional[Bot] = None
 
-# job_id -> info
 JOBS: Dict[str, dict] = {}
 
 # ===================== Helpers =====================
@@ -46,15 +46,13 @@ def esc(s: str) -> str:
 def fmt_bytes(n: Optional[float]) -> str:
     if n is None:
         return "?"
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {u}"
+    for u in ("B","KB","MB","GB","TB"):
+        if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
     return f"{n:.1f} PB"
 
 def fmt_eta(sec: Optional[float]) -> str:
-    if sec is None:
-        return "?"
+    if sec is None: return "?"
     sec = max(0, int(sec))
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
@@ -62,7 +60,7 @@ def fmt_eta(sec: Optional[float]) -> str:
 
 def looks_video(path: str) -> bool:
     ext = os.path.splitext(path)[1].lower().lstrip(".")
-    return ext in {"mp4", "mkv", "webm", "mov", "m4v"}
+    return ext in {"mp4","mkv","webm","mov","m4v"}
 
 def file_too_large(path: str) -> bool:
     try:
@@ -71,7 +69,7 @@ def file_too_large(path: str) -> bool:
         return False
 
 def detect_cookiefile() -> Optional[str]:
-    for c in ("cookies.txt", "cookies/cookies.txt", "youtube-cookies.txt"):
+    for c in ("cookies.txt","cookies/cookies.txt","youtube-cookies.txt"):
         if os.path.isfile(c):
             return os.path.abspath(c)
     return None
@@ -81,60 +79,108 @@ def bar(pct: float, width: int = 18) -> str:
     fill = int(width * pct / 100.0)
     return "[" + "#" * fill + "–" * (width - fill) + "]"
 
-# Safely edit a message from yt-dlp hook threads
 def schedule_edit(loop: asyncio.AbstractEventLoop, message: Message, text: str, reply_markup=None):
     async def _edit():
         with suppress(Exception):
             await message.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     asyncio.run_coroutine_threadsafe(_edit(), loop)
 
-def parse_height(fmt: dict) -> Optional[int]:
-    """Get a numeric height from a yt-dlp format dict."""
-    h = fmt.get("height")
-    if isinstance(h, int) and h > 0:
-        return h
-    # Try "resolution" like "1280x720"
-    res = fmt.get("resolution") or ""
-    m = re.search(r"x(\d+)", res)
-    if m:
-        return int(m.group(1))
-    # Try format_note like "720p"
-    note = fmt.get("format_note") or ""
-    m = re.search(r"(\d+)\s*p", note)
-    if m:
-        return int(m.group(1))
-    return None
+def host_title(url: str) -> str:
+    host = urlparse(url).netloc or "video"
+    return f"{host} video"
 
-def extract_info_with_fallback(url: str) -> Tuple[dict, bool]:
+def common_headers(url: str) -> dict:
+    return {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
+        "Referer": url,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+def http_get(url: str) -> str:
+    # NOTE: some hosts need Referer=self and relaxed SSL; adjust if needed
+    r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     """
-    Try normal extractor first. On extractor errors, retry with force_generic_extractor.
-    Returns (info, used_generic).
+    Return (m3u8_urls, mp4_urls) discovered in the HTML via common patterns.
     """
-    base = {"skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True}
+    m3u8 = set()
+    mp4 = set()
+
+    # <source src="...">
+    for m in re.findall(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        u = urljoin(base_url, m)
+        if ".m3u8" in u: m3u8.add(u)
+        if u.lower().endswith(".mp4"): mp4.add(u)
+
+    # src/file/url keys in JS/JSON
+    for m in re.findall(r'(?:src|file|hls|url)\s*[:=]\s*["\'](http[^"\']+)["\']', html, re.I):
+        u = urljoin(base_url, m)
+        if ".m3u8" in u: m3u8.add(u)
+        if ".mp4" in u: mp4.add(u)
+
+    # plain .m3u8 or .mp4
+    for m in re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html, re.I):
+        m3u8.add(m)
+    for m in re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html, re.I):
+        mp4.add(m)
+
+    return list(m3u8), list(mp4)
+
+def m3u8_heights(m3u8_text: str) -> List[int]:
+    # Parse #EXT-X-STREAM-INF lines for RESOLUTION=WxH
+    hs = set()
+    for line in m3u8_text.splitlines():
+        m = re.search(r"RESOLUTION=\s*\d+x(\d+)", line)
+        if m:
+            hs.add(int(m.group(1)))
+    return sorted(hs, reverse=True)
+
+def fetch_text(url: str) -> Optional[str]:
+    try:
+        r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return None
+
+def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
+    """
+    Try normal probe; on failure try generic. Return (info, used_generic, err_text_if_failed).
+    """
+    base = {
+        "skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True,
+        "http_headers": common_headers(url), "nocheckcertificate": True
+    }
+    cookiefile = detect_cookiefile()
+    if cookiefile:
+        base["cookiefile"] = cookiefile
     try:
         with yt_dlp.YoutubeDL(base) as y:
-            info = y.extract_info(url, download=False)
-            return info, False
+            return y.extract_info(url, download=False), False, None
     except Exception:
-        # Retry using generic extractor
-        base["force_generic_extractor"] = True
-        with yt_dlp.YoutubeDL(base) as y:
-            info = y.extract_info(url, download=False)
-            return info, True
+        try:
+            base2 = dict(base); base2["force_generic_extractor"] = True
+            with yt_dlp.YoutubeDL(base2) as y:
+                return y.extract_info(url, download=False), True, None
+        except Exception as e2:
+            return None, False, f"{type(e2).__name__}: {e2}"
 
 # ===================== Keyboards =====================
-def kb_format_choices(job_id: str, heights: List[int]):
+def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True):
     kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="Best", callback_data=f"get:{job_id}:best"))
+    if include_best:
+        kb.add(InlineKeyboardButton(text="Best", callback_data=f"get:{job_id}:best"))
     for h in sorted(set(heights), reverse=True):
         if h:
             kb.add(InlineKeyboardButton(text=f"{h}p", callback_data=f"get:{job_id}:h{h}"))
     kb.adjust(3)
-    return kb.as_markup()
-
-def kb_cancel(job_id: str):
-    kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
+    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
     return kb.as_markup()
 
 # ===================== Commands =====================
@@ -142,8 +188,8 @@ def kb_cancel(job_id: str):
 async def start_cmd(m: Message):
     await m.reply(
         "Send a video/page URL.\n"
-        "I’ll probe formats → show actual qualities (Best, 1080p, 720p, …) → download with live <b>% / speed / ETA</b> and send it.\n"
-        "<i>Tip: For age/consent-gated or anti-bot sites, put a Netscape <code>cookies.txt</code> next to the bot.</i>",
+        "I show the real qualities (Best, 1080p, 720p, …) ➜ download with live <b>% / speed / ETA</b> ➜ send the file.\n"
+        "<i>For some sites, a Netscape <code>cookies.txt</code> may be required (age/consent/anti-bot).</i>",
         parse_mode="HTML"
     )
 
@@ -157,41 +203,109 @@ async def on_url(m: Message):
     url = URL_RE.search(m.text).group(1)
     msg = await m.reply("🔎 Checking…")
 
-    try:
-        info, used_generic = extract_info_with_fallback(url)
-    except yt_dlp.utils.DownloadError as e:
-        tip = ""
-        s = str(e)
-        if "Sign in to confirm you're not a bot" in s or "account" in s.lower():
-            tip = "\nTip: add <code>cookies.txt</code>."
-        return await msg.edit_text(f"❌ Not downloadable / needs login.\n<code>{esc(s)}</code>{tip}", parse_mode="HTML")
-    except Exception as e:
-        # Covers site-specific extractor crashes like KeyError('videoModel')
-        return await msg.edit_text(f"❌ Not downloadable.\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML")
-
-    title = info.get("title") or "video"
-    fmts = info.get("formats") or []
-    heights = []
-    for f in fmts:
-        if f.get("vcodec") in (None, "none"):
-            continue
-        h = parse_height(f)
-        if h:
-            heights.append(h)
-
+    # 1) yt-dlp probe (normal -> generic)
+    info, used_generic, err = probe_info(url)
+    heights: List[int] = []
     job_id = uuid.uuid4().hex[:8]
-    JOBS[job_id] = {
-        "url": url,
-        "title": title,
-        "msg": msg,
-        "mode": DEFAULT_MODE,
-        "cancelled": False
-    }
+    job = {"url": url, "title": host_title(url), "msg": msg, "cancelled": False,
+           "dl_url": None, "dl_is_direct": False}
+    JOBS[job_id] = job
 
-    note = " (generic)" if used_generic else ""
+    if info:
+        fmts = info.get("formats") or []
+        for f in fmts:
+            if f.get("vcodec") in (None, "none"):
+                continue
+            h = f.get("height")
+            if isinstance(h, int) and h > 0:
+                heights.append(h)
+            else:
+                # fallback parse
+                res = f.get("resolution") or f.get("format_note") or ""
+                mres = re.search(r"(\d+)\s*p", res)
+                if mres:
+                    heights.append(int(mres.group(1)))
+        job["title"] = info.get("title") or job["title"]
+        suffix = " (generic)" if used_generic else ""
+        await msg.edit_text(
+            f"🎬 <b>{esc(job['title'])}</b>{esc(suffix)}\nChoose a quality:",
+            reply_markup=kb_format_choices(job_id, heights or []),
+            parse_mode="HTML"
+        )
+        return
+
+    # 2) Direct-media fallback (HTML scan)
+    html = None
+    try:
+        html = http_get(url)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+
+    m3u8s, mp4s = ([], [])
+    if html:
+        m3u8s, mp4s = find_direct_media(html, url)
+
+    if m3u8s:
+        # Prefer the first master m3u8
+        m3u8_url = m3u8s[0]
+        # Try to fetch it and parse qualities
+        mtxt = fetch_text(m3u8_url) or ""
+        hts = m3u8_heights(mtxt)
+        job["dl_url"] = m3u8_url
+        job["dl_is_direct"] = True  # direct URL; but yt-dlp can still handle it
+        await msg.edit_text(
+            f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found)\nChoose a quality:",
+            reply_markup=kb_format_choices(job_id, hts or [1080, 720, 480, 360]),
+            parse_mode="HTML"
+        )
+        return
+
+    if mp4s:
+        job["dl_url"] = mp4s[0]
+        job["dl_is_direct"] = True
+        await msg.edit_text(
+            f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found)\nChoose:",
+            reply_markup=kb_format_choices(job_id, [], include_best=True),
+            parse_mode="HTML"
+        )
+        return
+
+    # 3) As a last try: known embed hosts (e.g., vk/ok)
+    if html:
+        # Look for embedded VK/OK links
+        embeds = re.findall(r'https?://(?:vk\.com|ok\.ru)/[^"\']+', html, re.I)
+        if embeds:
+            emb = embeds[0]
+            info2, used_generic2, err2 = probe_info(emb)
+            if info2:
+                fmts = info2.get("formats") or []
+                for f in fmts:
+                    if f.get("vcodec") in (None, "none"):
+                        continue
+                    h = f.get("height")
+                    if isinstance(h, int) and h > 0:
+                        heights.append(h)
+                job["url"] = emb  # switch to the real embed URL
+                job["title"] = info2.get("title") or job["title"]
+                suffix = " (embed)"
+                await msg.edit_text(
+                    f"🎬 <b>{esc(job['title'])}</b>{esc(suffix)}\nChoose a quality:",
+                    reply_markup=kb_format_choices(job_id, heights or []),
+                    parse_mode="HTML"
+                )
+                return
+
+    # If we reached here, we couldn't prove formats. Still offer generic attempt.
+    note = ""
+    if err:
+        e = err.lower()
+        if any(w in e for w in ("sign in", "login", "account")):
+            note = "\n<i>Site may require login; you can add a <code>cookies.txt</code>.</i>"
+        else:
+            note = "\n<i>Extractor failed; we can still try a generic download.</i>"
     await msg.edit_text(
-        f"🎬 <b>{esc(title)}</b>{esc(note)}\nChoose a quality:",
-        reply_markup=kb_format_choices(job_id, heights or []),
+        f"🎬 <b>{esc(job['title'])}</b>\nCouldn’t list qualities.{note}\nPick one to try:",
+        reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360]),
         parse_mode="HTML"
     )
 
@@ -206,14 +320,13 @@ async def cb_cancel(cq: CallbackQuery):
     JOBS.pop(job_id, None)
     await cq.answer("Cancelled")
 
-def token_to_format(token: str) -> dict:
+def token_to_format(token: str) -> str:
     if token == "best":
-        return {"format": "bv*+ba/b"}  # video+audio
+        return "bv*+ba/b"
     if token.startswith("h") and token[1:].isdigit():
         h = int(token[1:])
-        # choose at or below the selected height
-        return {"format": f"bv*[height<={h}]+ba/b[height<={h}]"}
-    return {"format": "bv*+ba/b"}
+        return f"bv*[height<={h}]+ba/b[height<={h}]"
+    return "bv*+ba/b"
 
 @router.callback_query(F.data.startswith("get:"))
 async def cb_get(cq: CallbackQuery):
@@ -223,11 +336,12 @@ async def cb_get(cq: CallbackQuery):
     if not job:
         return await cq.answer("Job missing.", show_alert=True)
 
-    url = job["url"]
-    msg = job["msg"]
+    src_url = job.get("dl_url") or job["url"]
     title = job["title"]
+    msg = job["msg"]
+
     await cq.answer("Downloading…")
-    await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…", reply_markup=kb_cancel(job_id), parse_mode="HTML")
+    await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…", reply_markup=kb_format_choices(job_id, [], include_best=False), parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
     started = {"flag": False, "ts": 0, "file": None}
@@ -252,18 +366,17 @@ async def cb_get(cq: CallbackQuery):
                     f"{bar(pct)}  {pct:.1f}%\n"
                     f"{fmt_bytes(done)} / {fmt_bytes(total)} • {fmt_bytes(spd)}/s • ETA {fmt_eta(eta)}"
                 )
-                schedule_edit(loop, msg, text, reply_markup=kb_cancel(job_id))
+                schedule_edit(loop, msg, text, reply_markup=kb_format_choices(job_id, [], include_best=False))
         elif st == "finished":
             started["file"] = d.get("filename")
-            schedule_edit(loop, msg, "✅ Download complete. Finalizing…", reply_markup=kb_cancel(job_id))
+            schedule_edit(loop, msg, "✅ Download complete. Finalizing…", reply_markup=kb_format_choices(job_id, [], include_best=False))
 
-    choice = token_to_format(token)
+    fmt_sel = token_to_format(token)
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
 
-    # Build common options
     def build_opts(force_generic: bool = False):
         opts = {
-            "format": choice["format"],
+            "format": fmt_sel,
             "outtmpl": outtmpl,
             "noplaylist": True,
             "quiet": True,
@@ -274,38 +387,33 @@ async def cb_get(cq: CallbackQuery):
             "retries": 5,
             "fragment_retries": 10,
             "socket_timeout": 15,
-            "http_headers": {
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/124.0 Safari/537.36"),
-                "Referer": url
-            }
+            "http_headers": common_headers(src_url),
+            "nocheckcertificate": True,
         }
-        if force_generic:
-            opts["force_generic_extractor"] = True
         cookiefile = detect_cookiefile()
         if cookiefile:
             opts["cookiefile"] = cookiefile
+        if force_generic:
+            opts["force_generic_extractor"] = True
+        # If we already discovered a direct media URL, keep headers; yt-dlp can still handle m3u8/mp4
         return opts
 
     def run_dl_with_fallback():
-        # try native extractor
         try:
             with yt_dlp.YoutubeDL(build_opts(False)) as y:
-                info = y.extract_info(url, download=True)
+                info = y.extract_info(src_url, download=True)
                 return started["file"] or y.prepare_filename(info)
         except Exception:
-            # fallback: generic extractor (fixes KeyError('videoModel')-type issues)
             with yt_dlp.YoutubeDL(build_opts(True)) as y:
-                info = y.extract_info(url, download=True)
+                info = y.extract_info(src_url, download=True)
                 return started["file"] or y.prepare_filename(info)
 
     try:
         final_path = await loop.run_in_executor(None, run_dl_with_fallback)
     except yt_dlp.utils.DownloadError as e:
-        tip = ""
         s = str(e)
-        if "Sign in to confirm you're not a bot" in s or "account" in s.lower():
+        tip = ""
+        if any(w in s.lower() for w in ("sign in", "login", "account")):
             tip = "\nTip: add a valid <code>cookies.txt</code>."
         with suppress(Exception):
             await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=None)
@@ -335,14 +443,12 @@ async def cb_get(cq: CallbackQuery):
         JOBS.pop(job_id, None)
         return
 
-    # Upload
     with suppress(Exception):
         await msg.edit_text("⬆️ Uploading…", reply_markup=None)
 
     caption = "✅ Done."
     try:
         if DEFAULT_MODE == "video" and looks_video(final_path):
-            # Try sending as video; if Telegram rejects codec/container, fall back to document
             try:
                 await g_bot.send_video(msg.chat.id, FSInputFile(final_path), caption=caption)
             except Exception:
@@ -363,7 +469,6 @@ async def cb_get(cq: CallbackQuery):
 async def main():
     global g_bot
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    # Ensure no webhook conflicts with long polling
     await g_bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(g_bot, allowed_updates=dp.resolve_used_update_types())
 
