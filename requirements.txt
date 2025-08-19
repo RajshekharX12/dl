@@ -2,3 +2,4 @@ aiogram>=3.7,<4
 yt-dlp>=2025.8.11
 python-dotenv>=1.0.1
 requests>=2.32
+
