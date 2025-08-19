@@ -11,7 +11,7 @@ load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -285,16 +285,19 @@ async def cb_get(cq: CallbackQuery):
         JOBS.pop(job_id, None)
         return
 
+    # ---- upload via FSInputFile (fix) ----
     with suppress(Exception):
         await msg.edit_text("⬆️ Uploading…", reply_markup=None)
 
     caption = "✅ Done."
     try:
-        with open(final_path, "rb") as f:
-            if DEFAULT_MODE == "video" and looks_video(final_path):
-                await g_bot.send_video(msg.chat.id, f, caption=caption)
-            else:
-                await g_bot.send_document(msg.chat.id, f, caption=caption)
+        if DEFAULT_MODE == "video" and looks_video(final_path):
+            try:
+                await g_bot.send_video(msg.chat.id, FSInputFile(final_path), caption=caption)
+            except Exception:
+                await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
+        else:
+            await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
     except Exception as e:
         with suppress(Exception):
             await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode="HTML")
