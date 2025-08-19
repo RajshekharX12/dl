@@ -12,15 +12,21 @@ load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, FSInputFile
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton, FSInputFile, InputFile
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
 import yt_dlp
 import requests
 
-# =============== Config ===============
+# ===================== Config =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN in .env")
@@ -28,19 +34,21 @@ if not BOT_TOKEN:
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "1900"))
 DEFAULT_MODE = os.environ.get("DEFAULT_UPLOAD_MODE", "video").strip().lower()  # video|document
+COOKIES_DIR = os.path.join(os.getcwd(), "cookies")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(COOKIES_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
-# =============== Aiogram ===============
-dp = Dispatcher()
+# ===================== Aiogram =====================
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 g_bot: Optional[Bot] = None
 
 JOBS: Dict[str, dict] = {}
 
-# =============== Helpers ===============
+# ===================== Helpers =====================
 def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -68,12 +76,6 @@ def file_too_large(path: str) -> bool:
         return os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024
     except FileNotFoundError:
         return False
-
-def detect_cookiefile() -> Optional[str]:
-    for c in ("cookies.txt","cookies/cookies.txt","youtube-cookies.txt"):
-        if os.path.isfile(c):
-            return os.path.abspath(c)
-    return None
 
 def bar(pct: float, width: int = 18) -> str:
     pct = max(0.0, min(100.0, pct))
@@ -108,25 +110,18 @@ def http_get_text(url: str) -> str:
 def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     m3u8 = set()
     mp4 = set()
-
-    # <source src="...">
     for m in re.findall(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.I):
         u = urljoin(base_url, m)
         if ".m3u8" in u: m3u8.add(u)
         if u.lower().endswith(".mp4"): mp4.add(u)
-
-    # src/file/url keys in JS/JSON
     for m in re.findall(r'(?:src|file|hls|url)\s*[:=]\s*["\'](http[^"\']+)["\']', html, re.I):
         u = urljoin(base_url, m)
         if ".m3u8" in u: m3u8.add(u)
         if ".mp4" in u: mp4.add(u)
-
-    # plain .m3u8/.mp4 in text
     for m in re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html, re.I):
         m3u8.add(m)
     for m in re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html, re.I):
         mp4.add(m)
-
     return list(m3u8), list(mp4)
 
 def m3u8_heights(m3u8_text: str) -> List[int]:
@@ -145,15 +140,212 @@ def fetch_text(url: str) -> Optional[str]:
     except Exception:
         return None
 
+def is_cf_block(err_text: str) -> bool:
+    t = err_text.lower()
+    return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
+
+# ===================== Cookies manager =====================
+def clean_domain(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.startswith("http"):
+        s = urlparse(s).netloc
+    s = s.split("/")[0].lower()
+    s = s.lstrip(".")
+    return s or None
+
+def cookie_path_for_domain(domain: str) -> str:
+    return os.path.join(COOKIES_DIR, f"{domain}.txt")
+
+def list_cookie_domains() -> List[Tuple[str, int]]:
+    items = []
+    for name in os.listdir(COOKIES_DIR):
+        if name.endswith(".txt"):
+            path = os.path.join(COOKIES_DIR, name)
+            try:
+                ts = int(os.path.getmtime(path))
+            except Exception:
+                ts = 0
+            items.append((name[:-4], ts))
+    items.sort()
+    return items
+
+def find_cookie_for_url(url: str) -> Optional[str]:
+    host = urlparse(url).netloc.lower()
+    parts = host.split(".")
+    candidates = []
+    for i in range(len(parts)-1):
+        cand = ".".join(parts[i:])
+        candidates.append(cand)
+    # exact host first
+    candidates = [host] + candidates
+    for d in candidates:
+        p = cookie_path_for_domain(d)
+        if os.path.isfile(p):
+            return p
+    # fallback global cookies.txt in repo root, if present
+    fallback = os.path.join(os.getcwd(), "cookies.txt")
+    if os.path.isfile(fallback):
+        return fallback
+    return None
+
+# FSM states for /add and /del
+class CookieAddStates(StatesGroup):
+    waiting_domain = State()
+    waiting_body = State()
+
+class CookieDelStates(StatesGroup):
+    waiting_domain = State()
+
+# ===================== Keyboards =====================
+def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True):
+    kb = InlineKeyboardBuilder()
+    if include_best:
+        kb.add(InlineKeyboardButton(text="Best", callback_data=f"get:{job_id}:best"))
+    for h in sorted(set(heights), reverse=True):
+        if h:
+            kb.add(InlineKeyboardButton(text=f"{h}p", callback_data=f"get:{job_id}:h{h}"))
+    kb.adjust(3)
+    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
+    return kb.as_markup()
+
+# ===================== Commands =====================
+@router.message(Command("start"))
+async def start_cmd(m: Message):
+    await m.reply(
+        "Send a video/page URL.\n"
+        "I’ll show actual qualities (Best, 1080p, 720p, …), then download with live <b>% / speed / ETA</b> and send it.\n\n"
+        "<b>Cookies manager</b>\n"
+        "• /cookies — list cookies + help\n"
+        "• /add — add/replace cookies for a site\n"
+        "• /del — delete cookies for a site\n"
+        "• /clearcookies — delete <i>all</i> cookies\n",
+        parse_mode="HTML"
+    )
+
+@router.message(Command("help"))
+async def help_cmd(m: Message):
+    await start_cmd(m)
+
+@router.message(Command("cookies"))
+async def cookies_cmd(m: Message):
+    items = list_cookie_domains()
+    if not items:
+        text = (
+            "<b>Cookies</b>\n"
+            "No site cookies saved.\n\n"
+            "Use /add to store cookies for a domain (send a .txt file or paste Netscape cookies).\n"
+            "Bot will auto-use matching cookies per URL."
+        )
+    else:
+        lines = [f"• <code>{esc(dom)}</code>" for dom, _ in items]
+        text = (
+            "<b>Cookies</b>\nSaved domains:\n" + "\n".join(lines) +
+            "\n\nUse /add to add/replace, /del to remove one, /clearcookies to wipe all."
+        )
+    await m.reply(text, parse_mode="HTML")
+
+@router.message(Command("add"))
+async def add_cmd(m: Message, state: FSMContext):
+    await state.set_state(CookieAddStates.waiting_domain)
+    await m.reply("Send the <b>site</b> (domain or URL) you want to save cookies for.", parse_mode="HTML")
+
+@router.message(CookieAddStates.waiting_domain)
+async def add_wait_domain(m: Message, state: FSMContext):
+    dom = clean_domain(m.text or "")
+    if not dom:
+        return await m.reply("Invalid site. Send a domain (e.g. <code>example.com</code>) or a full URL.", parse_mode="HTML")
+    await state.update_data(domain=dom)
+    await state.set_state(CookieAddStates.waiting_body)
+    await m.reply(
+        f"Okay. Send cookies for <code>{esc(dom)}</code> now:\n"
+        "• Either upload a <b>.txt</b> file (Netscape format),\n"
+        "• Or paste the cookie text here.",
+        parse_mode="HTML"
+    )
+
+@router.message(CookieAddStates.waiting_body, F.document)
+async def add_cookie_file(m: Message, state: FSMContext):
+    data = await state.get_data()
+    dom = data.get("domain")
+    if not dom:
+        await state.clear()
+        return await m.reply("Session lost. Run /add again.")
+    path = cookie_path_for_domain(dom)
+    try:
+        await g_bot.download(m.document, destination=path)
+        await state.clear()
+        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML")
+    except Exception as e:
+        await state.clear()
+        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML")
+
+@router.message(CookieAddStates.waiting_body)
+async def add_cookie_text(m: Message, state: FSMContext):
+    data = await state.get_data()
+    dom = data.get("domain")
+    if not dom:
+        await state.clear()
+        return await m.reply("Session lost. Run /add again.")
+    path = cookie_path_for_domain(dom)
+    try:
+        txt = (m.text or "").strip()
+        if not txt:
+            return await m.reply("Empty text. Send a .txt file or paste cookie lines.")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(txt + ("\n" if not txt.endswith("\n") else ""))
+        await state.clear()
+        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML")
+    except Exception as e:
+        await state.clear()
+        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML")
+
+@router.message(Command("del"))
+async def del_cmd(m: Message, state: FSMContext):
+    await state.set_state(CookieDelStates.waiting_domain)
+    await m.reply("Send the <b>site</b> (domain or URL) whose cookies you want to delete.", parse_mode="HTML")
+
+@router.message(CookieDelStates.waiting_domain)
+async def del_wait_domain(m: Message, state: FSMContext):
+    dom = clean_domain(m.text or "")
+    await state.clear()
+    if not dom:
+        return await m.reply("Invalid site. Send a domain (e.g. <code>example.com</code>) or a full URL.", parse_mode="HTML")
+    path = cookie_path_for_domain(dom)
+    if not os.path.isfile(path):
+        return await m.reply(f"No cookies for <code>{esc(dom)}</code>.", parse_mode="HTML")
+    try:
+        os.remove(path)
+        return await m.reply(f"🗑️ Deleted cookies for <code>{esc(dom)}</code>.", parse_mode="HTML")
+    except Exception as e:
+        return await m.reply(f"❌ Failed to delete: <code>{esc(str(e))}</code>", parse_mode="HTML")
+
+@router.message(Command("clearcookies"))
+async def clearcookies_cmd(m: Message):
+    # Simple confirmation pattern: user must reply "YES"
+    await m.reply(
+        "This will delete <b>ALL</b> saved cookies. Reply with <code>YES</code> to confirm.",
+        parse_mode="HTML"
+    )
+
+@router.message(F.text == "YES")
+async def clearcookies_yes(m: Message):
+    deleted = 0
+    for name in os.listdir(COOKIES_DIR):
+        if name.endswith(".txt"):
+            with suppress(Exception):
+                os.remove(os.path.join(COOKIES_DIR, name))
+                deleted += 1
+    await m.reply(f"✅ Deleted {deleted} cookie file(s).")
+
+# ===================== Probe & download =====================
 def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
-    """
-    Try normal probe; on failure try generic. Return (info, used_generic, err_text_if_failed).
-    """
     base = {
         "skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True,
         "http_headers": common_headers(url), "nocheckcertificate": True
     }
-    cookiefile = detect_cookiefile()
+    cookiefile = find_cookie_for_url(url)
     if cookiefile:
         base["cookiefile"] = cookiefile
     try:
@@ -167,37 +359,13 @@ def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
         except Exception as e2:
             return None, False, f"{type(e2).__name__}: {e2}"
 
-def is_cf_block(err_text: str) -> bool:
-    t = err_text.lower()
-    return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
+def http_try_get(url: str) -> Optional[str]:
+    try:
+        return http_get_text(url)
+    except Exception:
+        return None
 
-# =============== Keyboards ===============
-def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True):
-    kb = InlineKeyboardBuilder()
-    if include_best:
-        kb.add(InlineKeyboardButton(text="Best", callback_data=f"get:{job_id}:best"))
-    for h in sorted(set(heights), reverse=True):
-        if h:
-            kb.add(InlineKeyboardButton(text=f"{h}p", callback_data=f"get:{job_id}:h{h}"))
-    kb.adjust(3)
-    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
-    return kb.as_markup()
-
-# =============== Commands ===============
-@router.message(Command("start"))
-async def start_cmd(m: Message):
-    await m.reply(
-        "Send a video/page URL.\n"
-        "I show real qualities (Best, 1080p, 720p, …) → download with live <b>% / speed / ETA</b> → send the file.\n"
-        "<i>Some sites require login/consent or block bots. For authorized access, add a Netscape <code>cookies.txt</code> next to the bot.</i>",
-        parse_mode="HTML"
-    )
-
-@router.message(Command("help"))
-async def help_cmd(m: Message):
-    await start_cmd(m)
-
-# =============== URL handler ===============
+# ===================== URL handler =====================
 @router.message(F.text.regexp(URL_RE))
 async def on_url(m: Message):
     url = URL_RE.search(m.text).group(1)
@@ -208,7 +376,7 @@ async def on_url(m: Message):
            "dl_url": None, "dl_is_direct": False}
     JOBS[job_id] = job
 
-    # 1) yt-dlp probe (native -> generic)
+    # yt-dlp probe
     info, used_generic, err = probe_info(url)
     if info:
         heights: List[int] = []
@@ -232,32 +400,25 @@ async def on_url(m: Message):
         )
         return
 
-    # 2) Direct-media fallback (HTML scan)
-    heights_fallback: List[int] = []
+    # direct-media fallback
     note = ""
     if err and is_cf_block(err):
-        note = "\n<i>Site is protected by anti-bot. I can’t help bypass that. "
-        note += "If you have access, export your session as <code>cookies.txt</code> and try again, or paste a direct .mp4/.m3u8 link.</i>"
+        note = "\n<i>Site uses anti-bot protection. If you have access, export session cookies to <code>cookies.txt</code> via /add, or paste a direct .mp4/.m3u8.</i>"
     elif err:
-        note = f"\n<i>Extractor failed ({esc(err)}). We can still try a generic attempt.</i>"
+        note = f"\n<i>Extractor failed ({esc(err)}). We can try a generic attempt.</i>"
 
-    html = None
-    try:
-        html = http_get_text(url)
-    except Exception:
-        html = None
-
+    html = http_try_get(url)
     if html:
         m3u8s, mp4s = find_direct_media(html, url)
         if m3u8s:
             m3u8_url = m3u8s[0]
             mtxt = fetch_text(m3u8_url) or ""
-            heights_fallback = m3u8_heights(mtxt) or [1080, 720, 480, 360]
+            heights = m3u8_heights(mtxt) or [1080, 720, 480, 360]
             job["dl_url"] = m3u8_url
             job["dl_is_direct"] = True
             await msg.edit_text(
                 f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found){note}\nChoose a quality:",
-                reply_markup=kb_format_choices(job_id, heights_fallback),
+                reply_markup=kb_format_choices(job_id, heights),
                 parse_mode="HTML"
             )
             return
@@ -271,14 +432,13 @@ async def on_url(m: Message):
             )
             return
 
-    # 3) No formats discovered → generic try menu
     await msg.edit_text(
         f"🎬 <b>{esc(job['title'])}</b>\nCouldn’t list qualities.{note}\nPick one to try:",
         reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360]),
         parse_mode="HTML"
     )
 
-# =============== Callbacks ===============
+# ===================== Callbacks =====================
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(cq: CallbackQuery):
     _, job_id = cq.data.split(":")
@@ -299,7 +459,6 @@ def token_to_format(token: str) -> str:
 
 @router.callback_query(F.data.startswith("get:"))
 async def cb_get(cq: CallbackQuery):
-    # data: get:<job_id>:<token>
     _, job_id, token = cq.data.split(":")
     job = JOBS.get(job_id)
     if not job:
@@ -361,7 +520,7 @@ async def cb_get(cq: CallbackQuery):
             "http_headers": common_headers(src_url),
             "nocheckcertificate": True,
         }
-        cookiefile = detect_cookiefile()
+        cookiefile = find_cookie_for_url(src_url)
         if cookiefile:
             opts["cookiefile"] = cookiefile
         if force_generic:
@@ -384,19 +543,17 @@ async def cb_get(cq: CallbackQuery):
         s = str(e)
         tip = ""
         if is_cf_block(s):
-            tip = ("\n<i>This site is using anti-bot protection. I can’t help bypass that. "
-                   "If you have access, export cookies as <code>cookies.txt</code> or paste a direct .mp4/.m3u8.</i>")
-        elif any(w in s.lower() for w in ("sign in", "login", "account")):
-            tip = "\n<i>Login required. Add a valid <code>cookies.txt</code>.</i>"
+            tip = ("\n<i>Site is using anti-bot protection. I can’t bypass that. "
+                   "If you have access, add cookies via /add or paste a direct .mp4/.m3u8.</i>")
+        elif any(w in s.lower() for w in ("sign in", "login", "account", "age")):
+            tip = "\n<i>Login/consent required. Add cookies via /add.</i>"
         with suppress(Exception):
-            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}",
-                                parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=None)
         JOBS.pop(job_id, None)
         return
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>",
-                                parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=None)
         JOBS.pop(job_id, None)
         return
 
@@ -440,7 +597,7 @@ async def cb_get(cq: CallbackQuery):
         await msg.delete()
     JOBS.pop(job_id, None)
 
-# =============== Runner ===============
+# ===================== Runner =====================
 async def main():
     global g_bot
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
