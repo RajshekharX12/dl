@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import os
 import re
@@ -13,7 +14,7 @@ load_dotenv()
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardButton, FSInputFile, InputFile
+    Message, CallbackQuery, InlineKeyboardButton, FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
@@ -77,7 +78,7 @@ def file_too_large(path: str) -> bool:
     except FileNotFoundError:
         return False
 
-def bar(pct: float, width: int = 18) -> str:
+def bar(pct: float, width: int = 20) -> str:
     pct = max(0.0, min(100.0, pct))
     fill = int(width * pct / 100.0)
     return "[" + "#" * fill + "–" * (width - fill) + "]"
@@ -100,12 +101,16 @@ def common_headers(url: str) -> dict:
         "Referer": url,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
+        "Connection": "keep-alive",
     }
 
-def http_get_text(url: str) -> str:
-    r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
-    r.raise_for_status()
-    return r.text
+async def http_get_text_async(url: str) -> str:
+    def _get():
+        r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
+        r.raise_for_status()
+        return r.text
+    return await asyncio.to_thread(_get)
 
 def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     m3u8 = set()
@@ -132,14 +137,6 @@ def m3u8_heights(m3u8_text: str) -> List[int]:
             hs.add(int(m.group(1)))
     return sorted(hs, reverse=True)
 
-def fetch_text(url: str) -> Optional[str]:
-    try:
-        r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
-        r.raise_for_status()
-        return r.text
-    except Exception:
-        return None
-
 def is_cf_block(err_text: str) -> bool:
     t = err_text.lower()
     return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
@@ -151,8 +148,7 @@ def clean_domain(s: str) -> Optional[str]:
         return None
     if s.startswith("http"):
         s = urlparse(s).netloc
-    s = s.split("/")[0].lower()
-    s = s.lstrip(".")
+    s = s.split("/")[0].lower().lstrip(".")
     return s or None
 
 def cookie_path_for_domain(domain: str) -> str:
@@ -174,17 +170,11 @@ def list_cookie_domains() -> List[Tuple[str, int]]:
 def find_cookie_for_url(url: str) -> Optional[str]:
     host = urlparse(url).netloc.lower()
     parts = host.split(".")
-    candidates = []
-    for i in range(len(parts)-1):
-        cand = ".".join(parts[i:])
-        candidates.append(cand)
-    # exact host first
-    candidates = [host] + candidates
+    candidates = [host] + [".".join(parts[i:]) for i in range(len(parts)-1)]
     for d in candidates:
         p = cookie_path_for_domain(d)
         if os.path.isfile(p):
             return p
-    # fallback global cookies.txt in repo root, if present
     fallback = os.path.join(os.getcwd(), "cookies.txt")
     if os.path.isfile(fallback):
         return fallback
@@ -218,15 +208,69 @@ async def start_cmd(m: Message):
         "I’ll show actual qualities (Best, 1080p, 720p, …), then download with live <b>% / speed / ETA</b> and send it.\n\n"
         "<b>Cookies manager</b>\n"
         "• /cookies — list cookies + help\n"
-        "• /add — add/replace cookies for a site\n"
+        "• /add — add/replace cookies for a site (Netscape .txt or paste)\n"
         "• /del — delete cookies for a site\n"
-        "• /clearcookies — delete <i>all</i> cookies\n",
+        "• /clearcookies — delete <i>all</i> cookies\n\n"
+        "<b>Other</b>\n"
+        "• /mode — upload as video or document\n"
+        "• /setmax — set max Telegram upload size (MB)\n"
+        "• /status — show active jobs\n"
+        "• /purge — delete old files in downloads\n"
+        "• /about — info & tips",
         parse_mode="HTML"
     )
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
     await start_cmd(m)
+
+@router.message(Command("about"))
+async def about_cmd(m: Message):
+    await m.reply(
+        "This bot uses <code>yt-dlp</code> to fetch formats from many sites (including adult sites supported by yt-dlp).\n"
+        "For sites with age gates/login, add cookies via <b>/add</b>.\n"
+        "I won’t bypass DRM/paywalls or private Telegram channels.\n"
+        "Tip: Send the <i>video page</i> URL (not just a channel listing).\n",
+        parse_mode="HTML"
+    )
+
+@router.message(Command("mode"))
+async def mode_cmd(m: Message):
+    global DEFAULT_MODE
+    arg = (m.text or "").split(maxsplit=1)
+    if len(arg) == 2 and arg[1].strip().lower() in {"video","document"}:
+        DEFAULT_MODE = arg[1].strip().lower()
+        return await m.reply(f"✅ Upload mode set to <b>{DEFAULT_MODE}</b>.", parse_mode="HTML")
+    await m.reply(f"Current upload mode: <b>{DEFAULT_MODE}</b>\nUse <code>/mode video</code> or <code>/mode document</code>.", parse_mode="HTML")
+
+@router.message(Command("setmax"))
+async def setmax_cmd(m: Message):
+    global MAX_FILE_MB
+    parts = (m.text or "").split()
+    if len(parts) == 2 and parts[1].isdigit():
+        MAX_FILE_MB = max(1, int(parts[1]))
+        return await m.reply(f"✅ Max upload size set to <b>{MAX_FILE_MB} MB</b>.", parse_mode="HTML")
+    await m.reply(f"Usage: <code>/setmax 1900</code> (current: <b>{MAX_FILE_MB} MB</b>)", parse_mode="HTML")
+
+@router.message(Command("status"))
+async def status_cmd(m: Message):
+    if not JOBS:
+        return await m.reply("No active jobs.")
+    lines = []
+    for jid, j in JOBS.items():
+        lines.append(f"• <code>{jid}</code> — {esc(j.get('title','?'))}")
+    await m.reply("<b>Active jobs</b>:\n" + "\n".join(lines), parse_mode="HTML")
+
+@router.message(Command("purge"))
+async def purge_cmd(m: Message):
+    removed = 0
+    for name in os.listdir(DOWNLOAD_DIR):
+        p = os.path.join(DOWNLOAD_DIR, name)
+        if os.path.isfile(p):
+            with suppress(Exception):
+                os.remove(p)
+                removed += 1
+    await m.reply(f"🧹 Deleted {removed} files from <code>{esc(DOWNLOAD_DIR)}</code>.", parse_mode="HTML")
 
 @router.message(Command("cookies"))
 async def cookies_cmd(m: Message):
@@ -236,7 +280,7 @@ async def cookies_cmd(m: Message):
             "<b>Cookies</b>\n"
             "No site cookies saved.\n\n"
             "Use /add to store cookies for a domain (send a .txt file or paste Netscape cookies).\n"
-            "Bot will auto-use matching cookies per URL."
+            "Bot auto-uses matching cookies per URL."
         )
     else:
         lines = [f"• <code>{esc(dom)}</code>" for dom, _ in items]
@@ -323,7 +367,6 @@ async def del_wait_domain(m: Message, state: FSMContext):
 
 @router.message(Command("clearcookies"))
 async def clearcookies_cmd(m: Message):
-    # Simple confirmation pattern: user must reply "YES"
     await m.reply(
         "This will delete <b>ALL</b> saved cookies. Reply with <code>YES</code> to confirm.",
         parse_mode="HTML"
@@ -340,30 +383,54 @@ async def clearcookies_yes(m: Message):
     await m.reply(f"✅ Deleted {deleted} cookie file(s).")
 
 # ===================== Probe & download =====================
-def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
+def token_to_format(token: str) -> str:
+    if token == "best":
+        return "bv*+ba/b"
+    if token.startswith("h") and token[1:].isdigit():
+        h = int(token[1:])
+        return f"bv*[height<={h}]+ba/b[height<={h}]"
+    return "bv*+ba/b"
+
+def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
+    opts = {
+        "format": fmt,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "concurrent_fragment_downloads": 4,
+        "progress_hooks": [hook],
+        "merge_output_format": "mp4",
+        "retries": 5,
+        "fragment_retries": 10,
+        "socket_timeout": 15,
+        "http_headers": common_headers(url),
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "extractor_retries": 3,
+    }
+    cookiefile = find_cookie_for_url(url)
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    return opts
+
+async def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
     base = {
         "skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True,
-        "http_headers": common_headers(url), "nocheckcertificate": True
+        "http_headers": common_headers(url), "nocheckcertificate": True, "geo_bypass": True,
+        "extractor_retries": 2,
     }
     cookiefile = find_cookie_for_url(url)
     if cookiefile:
         base["cookiefile"] = cookiefile
     try:
-        with yt_dlp.YoutubeDL(base) as y:
-            return y.extract_info(url, download=False), False, None
+        return await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(base).extract_info(url, download=False)), False, None
     except Exception:
         try:
             base2 = dict(base); base2["force_generic_extractor"] = True
-            with yt_dlp.YoutubeDL(base2) as y:
-                return y.extract_info(url, download=False), True, None
+            return await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(base2).extract_info(url, download=False)), True, None
         except Exception as e2:
             return None, False, f"{type(e2).__name__}: {e2}"
-
-def http_try_get(url: str) -> Optional[str]:
-    try:
-        return http_get_text(url)
-    except Exception:
-        return None
 
 # ===================== URL handler =====================
 @router.message(F.text.regexp(URL_RE))
@@ -377,10 +444,10 @@ async def on_url(m: Message):
     JOBS[job_id] = job
 
     # yt-dlp probe
-    info, used_generic, err = probe_info(url)
+    info, used_generic, err = await probe_info(url)
     if info:
         heights: List[int] = []
-        for f in info.get("formats") or []:
+        for f in (info.get("formats") or []):
             if f.get("vcodec") in (None, "none"):
                 continue
             h = f.get("height")
@@ -388,7 +455,7 @@ async def on_url(m: Message):
                 heights.append(h)
             else:
                 res = f.get("resolution") or f.get("format_note") or ""
-                mh = re.search(r"(\d+)\s*p", res)
+                mh = re.search(r"(\d+)\s*p", res or "")
                 if mh:
                     heights.append(int(mh.group(1)))
         job["title"] = info.get("title") or job["title"]
@@ -407,13 +474,17 @@ async def on_url(m: Message):
     elif err:
         note = f"\n<i>Extractor failed ({esc(err)}). We can try a generic attempt.</i>"
 
-    html = http_try_get(url)
+    html = None
+    with suppress(Exception):
+        html = await http_get_text_async(url)
     if html:
         m3u8s, mp4s = find_direct_media(html, url)
         if m3u8s:
             m3u8_url = m3u8s[0]
-            mtxt = fetch_text(m3u8_url) or ""
-            heights = m3u8_heights(mtxt) or [1080, 720, 480, 360]
+            mtxt = ""
+            with suppress(Exception):
+                mtxt = await http_get_text_async(m3u8_url)
+            heights = m3u8_heights(mtxt or "") or [1080, 720, 480, 360]
             job["dl_url"] = m3u8_url
             job["dl_is_direct"] = True
             await msg.edit_text(
@@ -449,14 +520,6 @@ async def cb_cancel(cq: CallbackQuery):
     JOBS.pop(job_id, None)
     await cq.answer("Cancelled")
 
-def token_to_format(token: str) -> str:
-    if token == "best":
-        return "bv*+ba/b"
-    if token.startswith("h") and token[1:].isdigit():
-        h = int(token[1:])
-        return f"bv*[height<={h}]+ba/b[height<={h}]"
-    return "bv*+ba/b"
-
 @router.callback_query(F.data.startswith("get:"))
 async def cb_get(cq: CallbackQuery):
     _, job_id, token = cq.data.split(":")
@@ -469,12 +532,13 @@ async def cb_get(cq: CallbackQuery):
     msg = job["msg"]
 
     await cq.answer("Downloading…")
-    await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…",
-                        reply_markup=kb_format_choices(job_id, [], include_best=False),
-                        parse_mode="HTML")
+    with suppress(Exception):
+        await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…",
+                            reply_markup=kb_format_choices(job_id, [], include_best=False),
+                            parse_mode="HTML")
 
     loop = asyncio.get_running_loop()
-    started = {"flag": False, "ts": 0, "file": None}
+    started = {"flag": False, "ts": 0.0, "file": None}
 
     def hook(d):
         if JOBS.get(job_id, {}).get("cancelled"):
@@ -504,41 +568,20 @@ async def cb_get(cq: CallbackQuery):
     fmt_sel = token_to_format(token)
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
 
-    def build_opts(force_generic: bool = False):
-        opts = {
-            "format": fmt_sel,
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "concurrent_fragment_downloads": 4,
-            "progress_hooks": [hook],
-            "merge_output_format": "mp4",
-            "retries": 5,
-            "fragment_retries": 10,
-            "socket_timeout": 15,
-            "http_headers": common_headers(src_url),
-            "nocheckcertificate": True,
-        }
-        cookiefile = find_cookie_for_url(src_url)
-        if cookiefile:
-            opts["cookiefile"] = cookiefile
+    def run_dl(force_generic: bool = False):
+        opts = build_ytdlp_opts(src_url, fmt_sel, outtmpl, hook)
         if force_generic:
             opts["force_generic_extractor"] = True
-        return opts
-
-    def run_dl_with_fallback():
-        try:
-            with yt_dlp.YoutubeDL(build_opts(False)) as y:
-                info = y.extract_info(src_url, download=True)
-                return started["file"] or y.prepare_filename(info)
-        except Exception:
-            with yt_dlp.YoutubeDL(build_opts(True)) as y:
-                info = y.extract_info(src_url, download=True)
-                return started["file"] or y.prepare_filename(info)
+        with yt_dlp.YoutubeDL(opts) as y:
+            info = y.extract_info(src_url, download=True)
+            return started["file"] or y.prepare_filename(info)
 
     try:
-        final_path = await loop.run_in_executor(None, run_dl_with_fallback)
+        # normal → generic fallback
+        try:
+            final_path = await asyncio.to_thread(run_dl, False)
+        except Exception:
+            final_path = await asyncio.to_thread(run_dl, True)
     except yt_dlp.utils.DownloadError as e:
         s = str(e)
         tip = ""
@@ -572,6 +615,8 @@ async def cb_get(cq: CallbackQuery):
                 parse_mode="HTML",
                 reply_markup=None
             )
+        with suppress(Exception):
+            os.remove(final_path)
         JOBS.pop(job_id, None)
         return
 
@@ -589,17 +634,28 @@ async def cb_get(cq: CallbackQuery):
             await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode="HTML")
+            await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode=ParseMode.HTML)
+        with suppress(Exception):
+            os.remove(final_path)
         JOBS.pop(job_id, None)
         return
 
     with suppress(Exception):
         await msg.delete()
+    with suppress(Exception):
+        os.remove(final_path)
     JOBS.pop(job_id, None)
 
 # ===================== Runner =====================
+async def check_ffmpeg():
+    # yt-dlp can download without ffmpeg, but merging/HLS often needs it
+    from shutil import which
+    if which("ffmpeg") is None:
+        print("WARNING: ffmpeg not found in PATH. Install ffmpeg for best results (HLS/merge).")
+
 async def main():
     global g_bot
+    await check_ffmpeg()
     g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await g_bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(g_bot, allowed_updates=dp.resolve_used_update_types())
