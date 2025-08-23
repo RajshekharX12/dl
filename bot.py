@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+import json
 from contextlib import suppress
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
@@ -21,9 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# robust HTTP session for uploads (prevents "Cannot write to closing transport")
-from aiogram.client.session.aiohttp import AiohttpSession
-
+from aiogram.client.session.aiohttp import AiohttpSession  # robust session
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -61,8 +60,7 @@ def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def fmt_bytes(n: Optional[float]) -> str:
-    if n is None:
-        return "?"
+    if n is None: return "?"
     for u in ("B","KB","MB","GB","TB"):
         if n < 1024: return f"{n:.1f} {u}"
         n /= 1024
@@ -112,57 +110,32 @@ def common_headers(url: str) -> dict:
         "Connection": "keep-alive",
     }
 
-async def http_get_text_async(url: str) -> str:
+async def http_get_text_async(url: str, cookiejar: Optional[MozillaCookieJar] = None) -> Optional[str]:
     def _get():
-        r = requests.get(url, headers=common_headers(url), timeout=25, allow_redirects=True)
+        sess = requests.Session()
+        if cookiejar: sess.cookies = cookiejar
+        r = sess.get(url, headers=common_headers(url), timeout=25, allow_redirects=True)
         r.raise_for_status()
         return r.text
-    return await asyncio.to_thread(_get)
-
-def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
-    m3u8 = set()
-    mp4 = set()
-    for m in re.findall(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.I):
-        u = urljoin(base_url, m)
-        if ".m3u8" in u: m3u8.add(u)
-        if u.lower().endswith(".mp4"): mp4.add(u)
-    for m in re.findall(r'(?:src|file|hls|url)\s*[:=]\s*["\'](http[^"\']+)["\']', html, re.I):
-        u = urljoin(base_url, m)
-        if ".m3u8" in u: m3u8.add(u)
-        if ".mp4" in u: mp4.add(u)
-    for m in re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html, re.I):
-        m3u8.add(m)
-    for m in re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html, re.I):
-        mp4.add(m)
-    return list(m3u8), list(mp4)
-
-def m3u8_heights(m3u8_text: str) -> List[int]:
-    hs = set()
-    for line in m3u8_text.splitlines():
-        m = re.search(r"RESOLUTION=\s*\d+x(\d+)", line)
-        if m:
-            hs.add(int(m.group(1)))
-    return sorted(hs, reverse=True)
+    try:
+        return await asyncio.to_thread(_get)
+    except Exception:
+        return None
 
 def is_cf_block(err_text: str) -> bool:
     t = (err_text or "").lower()
     return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
 
 def safe_unlink(path: Optional[str]):
-    if not path:
-        return
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    if not path: return
+    try: os.remove(path)
+    except FileNotFoundError: pass
+    except Exception: pass
 
 # ---------- Cookies helpers ----------
 def clean_domain(s: str) -> Optional[str]:
     s = (s or "").strip()
-    if not s:
-        return None
+    if not s: return None
     if s.startswith("http"):
         s = urlparse(s).netloc
     s = s.split("/")[0].lower().lstrip(".")
@@ -194,8 +167,7 @@ def find_cookie_for_url(url: str) -> Optional[str]:
 
 def cookiejar_for_url(url: str) -> Optional[MozillaCookieJar]:
     path = find_cookie_for_url(url)
-    if not path:
-        return None
+    if not path: return None
     try:
         jar = MozillaCookieJar()
         jar.load(path, ignore_discard=True, ignore_expires=True)
@@ -211,22 +183,16 @@ _CURL_COOKIE_RE = re.compile(r"-H\s*[\"']?Cookie:\s*([^\"']+)[\"']?", re.I)
 def cookie_text_to_netscape(txt: str, domain: str) -> Optional[str]:
     src = (txt or "").strip()
     m = _CURL_COOKIE_RE.search(src) or _COOKIE_HDR_RE.search(src)
-    if m:
-        src = m.group(1)
-    if "=" not in src and ";" not in src:
-        return None
+    if m: src = m.group(1)
+    if "=" not in src and ";" not in src: return None
     pairs = []
     for part in src.strip().strip(";").split(";"):
-        if "=" not in part:
-            continue
+        if "=" not in part: continue
         name, val = part.split("=", 1)
-        name = name.strip()
-        val = val.strip()
-        if not name:
-            continue
+        name = name.strip(); val = val.strip()
+        if not name: continue
         pairs.append((name, val))
-    if not pairs:
-        return None
+    if not pairs: return None
     exp = int(_time.time()) + 180 * 24 * 3600  # 180 days
     dom = "." + domain.lstrip(".")
     lines = ["# Netscape HTTP Cookie File"]
@@ -234,7 +200,69 @@ def cookie_text_to_netscape(txt: str, domain: str) -> Optional[str]:
         lines.append(f"{dom}\tTRUE\t/\tFALSE\t{exp}\t{name}\t{val}")
     return "\n".join(lines) + "\n"
 
-# ===================== Keyboards (inline) =====================
+# ===================== Media sniffing (smarter) =====================
+_PREVIEW_HINTS = re.compile(r"(sprite|thumb|preview|preload|poster|\.gif|\.webp)", re.I)
+
+def _head_info(url: str, cookiejar: Optional[MozillaCookieJar] = None) -> Tuple[Optional[str], Optional[int]]:
+    """Return (content_type, content_length)."""
+    try:
+        sess = requests.Session()
+        if cookiejar: sess.cookies = cookiejar
+        r = sess.head(url, headers=common_headers(url), timeout=20, allow_redirects=True)
+        ct = r.headers.get("content-type", "").lower()
+        cl = r.headers.get("content-length")
+        return ct, (int(cl) if cl and cl.isdigit() else None)
+    except Exception:
+        return None, None
+
+def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
+    m3u8 = set(); mp4 = set()
+    # <source> tags
+    for m in re.findall(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        u = urljoin(base_url, m); 
+        if ".m3u8" in u: m3u8.add(u)
+        if u.lower().endswith(".mp4"): mp4.add(u)
+    # common JS keys
+    for m in re.findall(r'(?:src|file|hls|url)\s*[:=]\s*["\'](http[^"\']+)["\']', html, re.I):
+        u = urljoin(base_url, m)
+        if ".m3u8" in u: m3u8.add(u)
+        if ".mp4" in u: mp4.add(u)
+    # plain URLs
+    for m in re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html, re.I): m3u8.add(m)
+    for m in re.findall(r'https?://[^\s"\']+\.mp4[^\s"\']*', html, re.I): mp4.add(m)
+    # JSON-LD video objects
+    for m in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I|re.S):
+        with suppress(Exception):
+            data = json.loads(m.strip())
+            objs = data if isinstance(data, list) else [data]
+            for obj in objs:
+                if isinstance(obj, dict) and obj.get("@type","").lower() in {"videoobject","videonewsobject","clip"}:
+                    cu = obj.get("contentUrl") or obj.get("url") or obj.get("embedUrl")
+                    if isinstance(cu, str):
+                        u = urljoin(base_url, cu)
+                        if ".m3u8" in u: m3u8.add(u)
+                        if u.lower().endswith(".mp4"): mp4.add(u)
+    return list(m3u8), list(mp4)
+
+def filter_real_videos(mp4s: List[str], cookiejar: Optional[MozillaCookieJar]) -> List[str]:
+    """Drop previews/gifs; keep only video/* with decent size."""
+    good = []
+    for u in mp4s:
+        if _PREVIEW_HINTS.search(u):  # looks like preview/sprite
+            continue
+        ct, cl = _head_info(u, cookiejar)
+        if ct and ct.startswith("video") and (cl is None or cl > 5 * 1024 * 1024):  # >5MB
+            good.append(u)
+    return good
+
+def m3u8_heights(m3u8_text: str) -> List[int]:
+    hs = set()
+    for line in m3u8_text.splitlines():
+        m = re.search(r"RESOLUTION=\s*\d+x(\d+)", line)
+        if m: hs.add(int(m.group(1)))
+    return sorted(hs, reverse=True)
+
+# ===================== Keyboards =====================
 def main_menu_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -291,6 +319,34 @@ def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True
     kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
     return kb.as_markup()
 
+def kb_fallback_and_cookie(job_id: str, url: str, heights: List[int] | None = None):
+    """Show quality picks + cookie actions + retry."""
+    domain = urlparse(url).netloc.lower()
+    has_cookie = find_cookie_for_url(url) is not None
+    kb = InlineKeyboardBuilder()
+
+    # qualities
+    if heights:
+        kb.add(InlineKeyboardButton(text="Best", callback_data=f"get:{job_id}:best"))
+        for h in sorted(set(heights), reverse=True):
+            kb.add(InlineKeyboardButton(text=f"{h}p", callback_data=f"get:{job_id}:h{h}"))
+        kb.adjust(3)
+
+    # cookie actions
+    if has_cookie:
+        kb.row(InlineKeyboardButton(text=f"🔑 Use cookies ({domain})", callback_data=f"job:recheck:{job_id}"))
+    else:
+        kb.row(InlineKeyboardButton(text=f"➕ Add cookies ({domain})", callback_data=f"job:cookie:add:{job_id}:{domain}"))
+        kb.row(InlineKeyboardButton(text="📋 Paste Cookie header", callback_data=f"job:cookie:paste:{job_id}:{domain}"))
+
+    # retry & generic
+    kb.row(
+        InlineKeyboardButton(text="🔁 Recheck now", callback_data=f"job:recheck:{job_id}"),
+        InlineKeyboardButton(text="🧪 Force generic", callback_data=f"job:forcegen:{job_id}")
+    )
+    kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
+    return kb.as_markup()
+
 def confirm_kb(prefix: str) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -310,11 +366,11 @@ class CookieDelStates(StatesGroup):
 class SetMaxState(StatesGroup):
     waiting_custom = State()
 
-# ===================== Commands -> Inline Menus =====================
+# ===================== Commands =====================
 @router.message(Command("start"))
 async def start_cmd(m: Message):
     txt = (
-        "Send a video/page URL to download.\n"
+        "Send a video/page URL.\n"
         "I’ll show qualities (Best/1080p/720p/…), then download with live <b>% / speed / ETA</b> and send it.\n\n"
         "Use the inline menu below for cookies, settings, status and cleanup."
     )
@@ -328,7 +384,7 @@ async def menu_cmd(m: Message):
 async def help_cmd(m: Message):
     await start_cmd(m)
 
-# ===================== Inline Menu Callbacks =====================
+# ===================== Inline Menus =====================
 @router.callback_query(F.data == "menu:root")
 async def menu_root(cq: CallbackQuery):
     await cq.answer()
@@ -345,9 +401,7 @@ async def menu_cookies(cq: CallbackQuery):
 async def menu_settings(cq: CallbackQuery):
     await cq.answer()
     with suppress(Exception):
-        await cq.message.edit_text(
-            "Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup()
-        )
+        await cq.message.edit_text("Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup())
 
 @router.callback_query(F.data == "menu:status")
 async def menu_status(cq: CallbackQuery):
@@ -370,10 +424,9 @@ async def menu_purge(cq: CallbackQuery):
 async def menu_about(cq: CallbackQuery):
     await cq.answer()
     text = (
-        "This bot uses <code>yt-dlp</code> (supports many sites, incl. adult ones).\n"
-        "For login/18+ sites, add cookies via the Cookies menu.\n"
-        "No bypass for DRM/paywalls/private Telegram channels.\n"
-        "Tip: send the direct video page URL."
+        "Engine: <code>yt-dlp</code> + direct HLS/MP4. Adult sites supported with cookies.\n"
+        "Paste <code>Cookie:</code> header or upload netscape cookies. No DRM/private TG bypass.\n"
+        "Tips: install <b>ffmpeg</b> & optional <b>aria2c</b> on the VPS for maximum speed."
     )
     with suppress(Exception):
         await cq.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
@@ -397,12 +450,12 @@ async def purge_confirm(cq: CallbackQuery):
     with suppress(Exception):
         await cq.message.edit_text(f"🧹 Deleted {removed} files from <code>{esc(DOWNLOAD_DIR)}</code>.", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
 
-# ===================== Settings: mode & max =====================
+# ===================== Settings =====================
 @router.callback_query(F.data == "settings:mode")
 async def settings_mode(cq: CallbackQuery):
     global DEFAULT_MODE
     DEFAULT_MODE = "document" if DEFAULT_MODE == "video" else "video"
-    await cq.answer(f"Upload mode: {DEFAULT_MODE}", show_alert=False)
+    await cq.answer(f"Upload mode: {DEFAULT_MODE}")
     with suppress(Exception):
         await cq.message.edit_text("Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup())
 
@@ -419,8 +472,7 @@ async def settings_max_set(cq: CallbackQuery):
     try:
         MAX_FILE_MB = int(cq.data.rsplit(":", 1)[1])
     except Exception:
-        await cq.answer("Invalid value.", show_alert=True)
-        return
+        await cq.answer("Invalid value.", show_alert=True); return
     await cq.answer(f"Max set to {MAX_FILE_MB} MB")
     with suppress(Exception):
         await cq.message.edit_text("Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup())
@@ -451,13 +503,13 @@ async def state_cancel(cq: CallbackQuery, state: FSMContext):
     with suppress(Exception):
         await cq.message.edit_text("Cancelled.", reply_markup=main_menu_kb().as_markup())
 
-# ===================== Cookies Inline Flow =====================
+# ===================== Cookies inline flow =====================
 @router.callback_query(F.data == "cookies:list")
 async def cookies_list(cq: CallbackQuery):
     await cq.answer()
     items = list_cookie_domains()
     if not items:
-        text = "No cookies saved.\nUse ➕ Add to upload Netscape cookies (.txt) or paste cookie text / Cookie: header."
+        text = "No cookies saved.\nUse ➕ Add to upload Netscape (.txt) or paste Cookie header."
     else:
         lines = [f"• <code>{esc(d)}</code>" for d in items]
         text = "<b>Saved cookie domains</b>:\n" + "\n".join(lines)
@@ -528,6 +580,7 @@ async def add_cookie_text(m: Message, state: FSMContext):
         await state.clear()
         return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
+# Quick delete flow
 @router.callback_query(F.data == "cookies:del")
 async def cookies_del(cq: CallbackQuery):
     await cq.answer()
@@ -549,10 +602,8 @@ async def cookies_del_domain(cq: CallbackQuery):
     dom = cq.data.split(":", 2)[2]
     path = cookie_path_for_domain(dom)
     if not os.path.isfile(path):
-        await cq.answer("Not found.")
-        return
-    with suppress(Exception):
-        os.remove(path)
+        await cq.answer("Not found."); return
+    with suppress(Exception): os.remove(path)
     await cq.answer(f"Deleted {dom}")
     with suppress(Exception):
         await cq.message.edit_text(f"🗑️ Deleted cookies for <code>{esc(dom)}</code>.", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
@@ -581,12 +632,20 @@ async def cookies_clear_confirm(cq: CallbackQuery):
 
 # ===================== yt-dlp helpers =====================
 def token_to_format(token: str) -> str:
-    if token == "best":
-        return "bv*+ba/b"
+    if token == "best": return "bv*+ba/b"
     if token.startswith("h") and token[1:].isdigit():
         h = int(token[1:])
         return f"bv*[height<={h}]+ba/b[height<={h}]"
     return "bv*+ba/b"
+
+def info_to_final_path(info: dict, ydl: yt_dlp.YoutubeDL) -> str:
+    # Preferred: yt-dlp 2023+ puts final path(s) here
+    req = info.get("requested_downloads") or []
+    if req and isinstance(req, list) and isinstance(req[0], dict):
+        fp = req[0].get("filepath")
+        if fp: return fp
+    # Fallback
+    return ydl.prepare_filename(info)
 
 def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
     opts = {
@@ -605,13 +664,11 @@ def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
         "nocheckcertificate": True,
         "geo_bypass": True,
         "extractor_retries": 4,
-        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks (speeds up on many hosts)
+        "http_chunk_size": 10 * 1024 * 1024,
         "throttled_rate": None,
     }
     cookiefile = find_cookie_for_url(url)
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
-    # Speed booster: aria2c for non-HLS direct media (if installed)
+    if cookiefile: opts["cookiefile"] = cookiefile
     if ARIA2:
         opts["external_downloader"] = "aria2c"
         opts["external_downloader_args"] = {
@@ -626,8 +683,7 @@ async def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
         "extractor_retries": 2,
     }
     cookiefile = find_cookie_for_url(url)
-    if cookiefile:
-        base["cookiefile"] = cookiefile
+    if cookiefile: base["cookiefile"] = cookiefile
     try:
         return await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(base).extract_info(url, download=False)), False, None
     except Exception:
@@ -652,16 +708,14 @@ async def on_url(m: Message):
     if info:
         heights: List[int] = []
         for f in (info.get("formats") or []):
-            if f.get("vcodec") in (None, "none"):
-                continue
+            if f.get("vcodec") in (None, "none"): continue
             h = f.get("height")
             if isinstance(h, int) and h > 0:
                 heights.append(h)
             else:
                 res = f.get("resolution") or f.get("format_note") or ""
                 mh = re.search(r"(\d+)\s*p", res or "")
-                if mh:
-                    heights.append(int(mh.group(1)))
+                if mh: heights.append(int(mh.group(1)))
         job["title"] = info.get("title") or job["title"]
         suffix = " (generic)" if used_generic else ""
         await msg.edit_text(
@@ -671,96 +725,209 @@ async def on_url(m: Message):
         )
         return
 
-    # Fallback probe to sniff direct media (used later as Strategy 3/4 too)
+    # Fallback probe with smarter sniff + cookie UX
+    cookiejar = cookiejar_for_url(url)
     note = ""
     if err and is_cf_block(err):
-        note = "\n<i>Site uses anti-bot protection. If you have access, add cookies, or paste a direct .mp4/.m3u8.</i>"
-    html = None
-    with suppress(Exception):
-        html = await http_get_text_async(url)
+        note = "\n<i>Site uses anti-bot protection. Add cookies or paste <code>Cookie:</code> header.</i>"
+    html = await http_get_text_async(url, cookiejar)
     if html:
         m3u8s, mp4s = find_direct_media(html, url)
+        # filter out previews
+        mp4s = filter_real_videos(mp4s, cookiejar)
         if m3u8s:
-            mtxt = ""
-            with suppress(Exception):
-                mtxt = await http_get_text_async(m3u8s[0])
-            heights = m3u8_heights(mtxt or "") or [1080, 720, 480, 360]
-            job["dl_url"] = m3u8s[0]
-            job["dl_is_direct"] = True
+            mtxt = await http_get_text_async(m3u8s[0], cookiejar) or ""
+            heights = m3u8_heights(mtxt) or [1080, 720, 480, 360]
+            job["dl_url"] = m3u8s[0]; job["dl_is_direct"] = True
             await msg.edit_text(
                 f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found){note}\nChoose a quality:",
-                reply_markup=kb_format_choices(job_id, heights),
+                reply_markup=kb_fallback_and_cookie(job_id, url, heights),
                 parse_mode="HTML"
             )
             return
         if mp4s:
-            job["dl_url"] = mp4s[0]
-            job["direct_mp4"] = mp4s[0]
-            job["dl_is_direct"] = True
+            job["dl_url"] = mp4s[0]; job["direct_mp4"] = mp4s[0]; job["dl_is_direct"] = True
             await msg.edit_text(
                 f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found){note}\nChoose:",
-                reply_markup=kb_format_choices(job_id, [], include_best=True),
+                reply_markup=kb_fallback_and_cookie(job_id, url, [1080, 720, 480, 360]),
                 parse_mode="HTML"
             )
             return
 
     await msg.edit_text(
-        f"🎬 <b>{esc(job['title'])}</b>\nCouldn’t list qualities.{note}\nPick one to try:",
-        reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360]),
+        f"🎬 <b>{esc(job['title'])}</b>\nCouldn’t list qualities.{note}\nPick one or try cookies:",
+        reply_markup=kb_fallback_and_cookie(job_id, url, [1080, 720, 480, 360]),
         parse_mode="HTML"
     )
 
-# ===================== 4-Strategy Download =====================
-async def sniff_direct_once(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return (m3u8_url, mp4_url) or (None,None)."""
+# ======= Cookie-aware retry actions =======
+@router.callback_query(F.data.startswith("job:cookie:add:"))
+async def job_cookie_add(cq: CallbackQuery, state: FSMContext):
+    _, _, _, job_id, domain = cq.data.split(":")
+    await state.set_state(CookieAddStates.waiting_body)
+    await state.update_data(domain=domain)
+    await cq.answer()
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✖️ Cancel", callback_data="state:cancel"))
     with suppress(Exception):
-        html = await http_get_text_async(url)
-        if html:
-            m3u8s, mp4s = find_direct_media(html, url)
-            return (m3u8s[0] if m3u8s else None, mp4s[0] if mp4s else None)
-    return (None, None)
+        await cq.message.edit_text(
+            f"Paste <code>Cookie:</code> header OR upload netscape <b>.txt</b> for <code>{esc(domain)}</code>.\n"
+            f"After saving, press <b>Recheck now</b>.",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
 
-async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Message, job_id: str) -> Optional[str]:
-    """Strategy 4: stream direct MP4 via requests with cookiejar + progress."""
+@router.callback_query(F.data.startswith("job:cookie:paste:"))
+async def job_cookie_paste(cq: CallbackQuery, state: FSMContext):
+    # same as add, just a different hint
+    return await job_cookie_add(cq, state)
+
+@router.callback_query(F.data.startswith("job:recheck:"))
+async def job_recheck(cq: CallbackQuery):
+    _, _, job_id = cq.data.split(":")
+    job = JOBS.get(job_id)
+    if not job:
+        await cq.answer("Job missing.", show_alert=True); return
+    await cq.answer("Rechecking…")
+    # re-run the probing block with possible new cookies
+    url = job["url"]
+    msg = job["msg"]
+    info, used_generic, err = await probe_info(url)
+    if info:
+        heights: List[int] = []
+        for f in (info.get("formats") or []):
+            if f.get("vcodec") in (None, "none"): continue
+            h = f.get("height")
+            if isinstance(h, int) and h > 0: heights.append(h)
+            else:
+                res = f.get("resolution") or f.get("format_note") or ""
+                mh = re.search(r"(\d+)\s*p", res or "")
+                if mh: heights.append(int(mh.group(1)))
+        job["title"] = info.get("title") or job["title"]
+        await msg.edit_text(
+            f"🎬 <b>{esc(job['title'])}</b>\nChoose a quality:",
+            reply_markup=kb_format_choices(job_id, heights or []),
+            parse_mode="HTML"
+        )
+        return
+    cookiejar = cookiejar_for_url(url)
+    html = await http_get_text_async(url, cookiejar)
+    if html:
+        m3u8s, mp4s = find_direct_media(html, url)
+        mp4s = filter_real_videos(mp4s, cookiejar)
+        if m3u8s:
+            mtxt = await http_get_text_async(m3u8s[0], cookiejar) or ""
+            heights = m3u8_heights(mtxt) or [1080, 720, 480, 360]
+            job["dl_url"] = m3u8s[0]; job["dl_is_direct"] = True
+            await msg.edit_text(
+                f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found)\nChoose a quality:",
+                reply_markup=kb_fallback_and_cookie(job_id, url, heights),
+                parse_mode="HTML"
+            )
+            return
+        if mp4s:
+            job["dl_url"] = mp4s[0]; job["direct_mp4"] = mp4s[0]; job["dl_is_direct"] = True
+            await msg.edit_text(
+                f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found)\nChoose:",
+                reply_markup=kb_fallback_and_cookie(job_id, url, [1080, 720, 480, 360]),
+                parse_mode="HTML"
+            )
+            return
+    await msg.edit_text(
+        f"🎬 <b>{esc(job['title'])}</b>\nStill couldn’t list qualities.\nTry another quality or add cookies:",
+        reply_markup=kb_fallback_and_cookie(job_id, url, [1080, 720, 480, 360]),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("job:forcegen:"))
+async def job_force_generic(cq: CallbackQuery):
+    _, _, job_id = cq.data.split(":")
+    job = JOBS.get(job_id)
+    if not job:
+        await cq.answer("Job missing.", show_alert=True); return
+    await cq.answer("Trying generic extractor…")
+    url = job["url"]
+    msg = job["msg"]
+    # force generic in probe
+    base = {
+        "skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True,
+        "http_headers": common_headers(url), "nocheckcertificate": True,
+        "geo_bypass": True, "force_generic_extractor": True
+    }
+    cookiefile = find_cookie_for_url(url)
+    if cookiefile: base["cookiefile"] = cookiefile
+    info = None
+    with suppress(Exception):
+        info = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(base).extract_info(url, download=False))
+    if info:
+        heights: List[int] = []
+        for f in (info.get("formats") or []):
+            if f.get("vcodec") in (None, "none"): continue
+            h = f.get("height")
+            if isinstance(h, int) and h > 0: heights.append(h)
+            else:
+                res = f.get("resolution") or f.get("format_note") or ""
+                mh = re.search(r"(\d+)\s*p", res or "")
+                if mh: heights.append(int(mh.group(1)))
+        job["title"] = info.get("title") or job["title"]
+        await msg.edit_text(
+            f"🎬 <b>{esc(job['title'])}</b>\nChoose a quality:",
+            reply_markup=kb_format_choices(job_id, heights or []),
+            parse_mode="HTML"
+        )
+        return
+    await msg.edit_text(
+        f"🎬 <b>{esc(job['title'])}</b>\nGeneric extractor also failed.\nTry cookies or another method:",
+        reply_markup=kb_fallback_and_cookie(job_id, url, [1080, 720, 480, 360]),
+        parse_mode="HTML"
+    )
+
+# ===================== Download logic (4 strategies) =====================
+async def sniff_direct_once(url: str) -> Tuple[Optional[str], Optional[str]]:
+    jar = cookiejar_for_url(url)
+    html = await http_get_text_async(url, jar)
+    if not html: return (None, None)
+    m3u8s, mp4s = find_direct_media(html, url)
+    mp4s = filter_real_videos(mp4s, jar)
+    return (m3u8s[0] if m3u8s else None, mp4s[0] if mp4s else None)
+
+async def direct_http_download(mp4_url: str, title: str, msg: Message, job_id: str) -> Optional[str]:
     parsed = urlparse(mp4_url)
     name = os.path.basename(parsed.path) or "video.mp4"
-    if not os.path.splitext(name)[1]:
-        name += ".mp4"
+    if not os.path.splitext(name)[1]: name += ".mp4"
     safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", title)[:150]
     filename = f"{safe_title} [direct].{os.path.splitext(name)[1].lstrip('.')}"
     path = os.path.join(DOWNLOAD_DIR, filename)
 
-    # session with cookies
     jar = cookiejar_for_url(mp4_url)
     sess = requests.Session()
     if jar: sess.cookies = jar
     sess.headers.update(common_headers(mp4_url))
-    # try to probe size
-    total = None
-    try:
-        h = sess.head(mp4_url, timeout=25, allow_redirects=True)
-        if 'content-length' in h.headers:
-            total = int(h.headers['content-length'])
-    except Exception:
-        pass
+
+    # sanity: ensure it's video/*
+    ct, cl = _head_info(mp4_url, jar)
+    if ct and not ct.startswith("video"):
+        raise yt_dlp.utils.DownloadError(f"Not video content-type: {ct or '?'}")
 
     r = sess.get(mp4_url, stream=True, timeout=25, allow_redirects=True)
     r.raise_for_status()
 
     loop = asyncio.get_running_loop()
-    downloaded = 0
-    chunk = 2 * 1024 * 1024  # 2MB
-    last = 0.0
+    downloaded = 0; chunk = 2 * 1024 * 1024; last = 0.0
+    total = None
+    try:
+        clh = r.headers.get("content-length")
+        if clh and clh.isdigit(): total = int(clh)
+    except Exception:
+        pass
+
     with open(path, "wb") as f:
         for data in r.iter_content(chunk_size=chunk):
             if JOBS.get(job_id, {}).get("cancelled"):
-                r.close()
-                with suppress(Exception): os.remove(path)
+                r.close(); with suppress(Exception): os.remove(path)
                 raise yt_dlp.utils.DownloadError("Cancelled by user")
-            if not data:
-                continue
-            f.write(data)
-            downloaded += len(data)
+            if not data: continue
+            f.write(data); downloaded += len(data)
             now = time.time()
             if now - last > 1.0:
                 last = now
@@ -770,11 +937,10 @@ async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Mess
                     f"{bar(pct if total else 0.0)}  {(pct if total else 0.0):.1f}%\n"
                     f"{fmt_bytes(downloaded)} / {fmt_bytes(total)}"
                 )
-                schedule_edit(loop, msg, text, reply_markup=kb_format_choices(job_id, [], include_best=False))
+                schedule_edit(loop, msg, text, reply_markup=None)
     return path
 
 async def send_with_retry(chat_id: int, path: str, caption: str, as_video: bool) -> None:
-    """Retry upload once if transport hiccups."""
     for attempt in range(2):
         try:
             if as_video and looks_video(path):
@@ -788,15 +954,13 @@ async def send_with_retry(chat_id: int, path: str, caption: str, as_video: bool)
         except Exception as e:
             if "closing transport" in str(e).lower() or "timeout" in str(e).lower():
                 if attempt == 0:
-                    await asyncio.sleep(2.0)
-                    continue
+                    await asyncio.sleep(2.0); continue
             raise
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(cq: CallbackQuery):
     _, job_id = cq.data.split(":")
-    if job_id in JOBS:
-        JOBS[job_id]["cancelled"] = True
+    if job_id in JOBS: JOBS[job_id]["cancelled"] = True
     with suppress(Exception):
         await cq.message.edit_text("🛑 Cancelled.", reply_markup=main_menu_kb().as_markup())
     JOBS.pop(job_id, None)
@@ -806,8 +970,7 @@ async def cb_cancel(cq: CallbackQuery):
 async def cb_get(cq: CallbackQuery):
     _, job_id, token = cq.data.split(":")
     job = JOBS.get(job_id)
-    if not job:
-        return await cq.answer("Job missing.", show_alert=True)
+    if not job: return await cq.answer("Job missing.", show_alert=True)
 
     src_url = job.get("url")
     title = job["title"]
@@ -824,7 +987,6 @@ async def cb_get(cq: CallbackQuery):
     started = {"flag": False, "ts": 0.0, "file": None}
     final_path: Optional[str] = None
 
-    # progress hook for yt-dlp
     def hook(d):
         if JOBS.get(job_id, {}).get("cancelled"):
             raise yt_dlp.utils.DownloadError("Cancelled by user")
@@ -833,11 +995,9 @@ async def cb_get(cq: CallbackQuery):
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes") or 0
             pct = (done / total * 100) if total else 0.0
-            spd = d.get("speed")
-            eta = d.get("eta")
+            spd = d.get("speed"); eta = d.get("eta")
             now = time.time()
-            if done and not started["flag"]:
-                started["flag"] = True
+            if done and not started["flag"]: started["flag"] = True
             if now - started["ts"] > 1.0:
                 started["ts"] = now
                 text = (
@@ -855,44 +1015,41 @@ async def cb_get(cq: CallbackQuery):
 
     def ytdlp_run(url: str, force_generic: bool = False):
         opts = build_ytdlp_opts(url, fmt_sel, outtmpl, hook)
-        if force_generic:
-            opts["force_generic_extractor"] = True
+        if force_generic: opts["force_generic_extractor"] = True
         with yt_dlp.YoutubeDL(opts) as y:
             info = y.extract_info(url, download=True)
-            return started["file"] or y.prepare_filename(info)
+            return info_to_final_path(info, y)
 
     try:
-        # ====== 4 strategies (auto) ======
+        # Strategy 1: native
         try:
-            final_path = await asyncio.to_thread(ytdlp_run, src_url, False)          # 1) native
+            final_path = await asyncio.to_thread(ytdlp_run, src_url, False)
         except Exception:
+            # Strategy 2: generic
             try:
-                final_path = await asyncio.to_thread(ytdlp_run, src_url, True)       # 2) generic
+                final_path = await asyncio.to_thread(ytdlp_run, src_url, True)
             except Exception:
-                # 3)/4) direct sniff
+                # Strategy 3/4: sniff direct
                 m3u8_url, mp4_url = None, None
                 if job.get("dl_url"):
-                    if job["dl_url"].endswith(".m3u8"):
-                        m3u8_url = job["dl_url"]
-                    elif job.get("direct_mp4"):
-                        mp4_url = job["direct_mp4"]
+                    if job["dl_url"].endswith(".m3u8"): m3u8_url = job["dl_url"]
+                    elif job.get("direct_mp4"): mp4_url = job["direct_mp4"]
                 if not (m3u8_url or mp4_url):
                     m3u8_url, mp4_url = await sniff_direct_once(src_url)
-
                 if m3u8_url:
-                    try:
+                    with suppress(Exception):
                         final_path = await asyncio.to_thread(ytdlp_run, m3u8_url, False)
-                    except Exception:
-                        pass
                 if not final_path and mp4_url:
-                    final_path = await direct_http_download(mp4_url, outtmpl, title, msg, job_id)  # 4) raw MP4
+                    final_path = await direct_http_download(mp4_url, title, msg, job_id)
 
         if not final_path or not os.path.exists(final_path):
             with suppress(Exception):
-                await msg.edit_text("❌ File not found after download.", reply_markup=main_menu_kb().as_markup())
+                await msg.edit_text(
+                    "❌ File not found after download.\nTry cookies or force generic:",
+                    reply_markup=kb_fallback_and_cookie(job_id, src_url, [1080, 720, 480, 360])
+                )
             return
 
-        # size-limit guard — let user pick a lower quality (we delete the big file)
         if file_too_large(final_path):
             with suppress(Exception):
                 await msg.edit_text(
@@ -903,28 +1060,33 @@ async def cb_get(cq: CallbackQuery):
                     reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360])
                 )
             safe_unlink(final_path)
-            return  # keep job so user can choose new quality
+            return
 
-        # upload (with retry to avoid “closing transport”)
         with suppress(Exception):
             await msg.edit_text("⬆️ Uploading…", reply_markup=None)
         await send_with_retry(msg.chat.id, final_path, "✅ Done.", (DEFAULT_MODE == "video"))
-
         with suppress(Exception):
             await msg.delete()
 
     except yt_dlp.utils.DownloadError as e:
-        s = str(e)
-        tip = ""
+        s = str(e); tip = ""
         if is_cf_block(s):
             tip = ("\n<i>Site is using anti-bot protection. Add cookies or provide a direct .mp4/.m3u8.</i>")
-        elif any(w in s.lower() for w in ("sign in", "login", "account", "age")):
-            tip = "\n<i>Login/consent required. Add cookies via Cookies ➕ Add.</i>"
+        elif any(w in s.lower() for w in ("sign in","login","account","age","consent")):
+            tip = "\n<i>Login/consent required. Add cookies via ➕ Add cookies.</i>"
         with suppress(Exception):
-            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+            await msg.edit_text(
+                f"❌ Download error:\n<code>{esc(s)}</code>{tip}",
+                parse_mode="HTML",
+                reply_markup=kb_fallback_and_cookie(job_id, src_url, [1080, 720, 480, 360])
+            )
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+            await msg.edit_text(
+                f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>",
+                parse_mode="HTML",
+                reply_markup=kb_fallback_and_cookie(job_id, src_url, [1080, 720, 480, 360])
+            )
     finally:
         safe_unlink(locals().get("final_path"))
         JOBS.pop(job_id, None)
@@ -938,7 +1100,7 @@ async def main():
     global g_bot
     await check_ffmpeg()
 
-    # IMPORTANT: aiogram expects numeric seconds here, not a ClientTimeout object
+    # aiogram expects numeric seconds, not ClientTimeout
     timeout_seconds = int(os.getenv("BOT_HTTP_TIMEOUT", "60"))
     session = AiohttpSession(timeout=timeout_seconds)
 
