@@ -8,8 +8,6 @@ import uuid
 from contextlib import suppress
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
-import mimetypes
-import math
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,7 +23,7 @@ from aiogram.client.default import DefaultBotProperties
 
 # robust HTTP session for uploads (fixes "Cannot write to closing transport")
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout, TCPConnector
+from aiohttp import ClientTimeout
 
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -34,6 +32,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import yt_dlp
 import requests
 from http.cookiejar import MozillaCookieJar
+from shutil import which
 
 # ===================== Config =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -48,6 +47,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(COOKIES_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+ARIA2 = which("aria2c") is not None  # auto use if installed
 
 # ===================== Aiogram =====================
 dp = Dispatcher(storage=MemoryStorage())
@@ -148,6 +148,16 @@ def m3u8_heights(m3u8_text: str) -> List[int]:
 def is_cf_block(err_text: str) -> bool:
     t = (err_text or "").lower()
     return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
+
+def safe_unlink(path: Optional[str]):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 # ---------- Cookies helpers ----------
 def clean_domain(s: str) -> Optional[str]:
@@ -596,12 +606,18 @@ def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
         "nocheckcertificate": True,
         "geo_bypass": True,
         "extractor_retries": 4,
-        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks often speed up
+        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks
         "throttled_rate": None,
     }
     cookiefile = find_cookie_for_url(url)
     if cookiefile:
         opts["cookiefile"] = cookiefile
+    # if aria2c available, let yt-dlp use it for non-HLS direct media (it can speed up a lot)
+    if ARIA2:
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "default": ["-x16", "-s16", "-k1M", "--allow-overwrite=true", "--summary-interval=0"]
+        }
     return opts
 
 async def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
@@ -656,7 +672,7 @@ async def on_url(m: Message):
         )
         return
 
-    # Fallback probe to sniff direct media (will also be used as Strategy 3/4 later)
+    # Fallback probe to sniff direct media (used later as Strategy 3/4 too)
     note = ""
     if err and is_cf_block(err):
         note = "\n<i>Site uses anti-bot protection. If you have access, add cookies, or paste a direct .mp4/.m3u8.</i>"
@@ -707,7 +723,6 @@ async def sniff_direct_once(url: str) -> Tuple[Optional[str], Optional[str]]:
 
 async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Message, job_id: str) -> Optional[str]:
     """Strategy 4: stream direct MP4 via requests with cookiejar + progress."""
-    # derive filename
     parsed = urlparse(mp4_url)
     name = os.path.basename(parsed.path) or "video.mp4"
     if not os.path.splitext(name)[1]:
@@ -730,7 +745,6 @@ async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Mess
     except Exception:
         pass
 
-    # stream
     r = sess.get(mp4_url, stream=True, timeout=25, allow_redirects=True)
     r.raise_for_status()
 
@@ -752,13 +766,12 @@ async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Mess
             if now - last > 1.0:
                 last = now
                 pct = (downloaded / total * 100.0) if total else 0.0
-                spd = None  # not trivial without timestamps per-chunk; keep UI consistent
                 text = (
                     f"⏬ <b>{esc(title)}</b>\n"
                     f"{bar(pct if total else 0.0)}  {(pct if total else 0.0):.1f}%\n"
                     f"{fmt_bytes(downloaded)} / {fmt_bytes(total)}"
                 )
-                schedule_edit(loop, msg, text, reply_markup=None)
+                schedule_edit(loop, msg, text, reply_markup=kb_format_choices(job_id, [], include_best=False))
     return path
 
 async def send_with_retry(chat_id: int, path: str, caption: str, as_video: bool) -> None:
@@ -774,8 +787,7 @@ async def send_with_retry(chat_id: int, path: str, caption: str, as_video: bool)
                 await g_bot.send_document(chat_id, FSInputFile(path), caption=caption)
             return
         except Exception as e:
-            # classic aiohttp noise when connection closes mid-upload
-            if "closing transport" in str(e).lower() or "Timeout" in str(e):
+            if "closing transport" in str(e).lower() or "timeout" in str(e).lower():
                 if attempt == 0:
                     await asyncio.sleep(2.0)
                     continue
@@ -811,8 +823,9 @@ async def cb_get(cq: CallbackQuery):
 
     loop = asyncio.get_running_loop()
     started = {"flag": False, "ts": 0.0, "file": None}
+    final_path: Optional[str] = None
 
-    # common progress hook for yt-dlp strategies
+    # progress hook for yt-dlp
     def hook(d):
         if JOBS.get(job_id, {}).get("cancelled"):
             raise yt_dlp.utils.DownloadError("Cancelled by user")
@@ -849,29 +862,22 @@ async def cb_get(cq: CallbackQuery):
             info = y.extract_info(url, download=True)
             return started["file"] or y.prepare_filename(info)
 
-    # --------- 4 STRATEGIES (auto) ----------
-    final_path = None
     try:
-        # Strategy 1: yt-dlp native extractor
+        # ====== 4 strategies (auto) ======
         try:
-            final_path = await asyncio.to_thread(ytdlp_run, src_url, False)
+            final_path = await asyncio.to_thread(ytdlp_run, src_url, False)          # 1) native
         except Exception:
-            # Strategy 2: yt-dlp generic extractor
             try:
-                final_path = await asyncio.to_thread(ytdlp_run, src_url, True)
+                final_path = await asyncio.to_thread(ytdlp_run, src_url, True)       # 2) generic
             except Exception:
-                # Strategy 3: sniff direct m3u8/mp4, prefer m3u8 via yt-dlp
+                # 3)/4) direct sniff
                 m3u8_url, mp4_url = None, None
                 if job.get("dl_url"):
-                    # we already sniffed earlier
-                    if job.get("dl_url", "").endswith(".m3u8"):
+                    if job["dl_url"].endswith(".m3u8"):
                         m3u8_url = job["dl_url"]
                     elif job.get("direct_mp4"):
                         mp4_url = job["direct_mp4"]
-                    else:
-                        # ensure both checked
-                        m3u8_url, mp4_url = await sniff_direct_once(src_url)
-                else:
+                if not (m3u8_url or mp4_url):
                     m3u8_url, mp4_url = await sniff_direct_once(src_url)
 
                 if m3u8_url:
@@ -879,11 +885,34 @@ async def cb_get(cq: CallbackQuery):
                         final_path = await asyncio.to_thread(ytdlp_run, m3u8_url, False)
                     except Exception:
                         pass
+                if not final_path and mp4_url:
+                    final_path = await direct_http_download(mp4_url, outtmpl, title, msg, job_id)  # 4) raw MP4
 
-                # Strategy 4: direct MP4 stream via requests (only if still no file and mp4 exists)
-                if not final_path and (mp4_url or job.get("direct_mp4")):
-                    mp4 = mp4_url or job.get("direct_mp4")
-                    final_path = await direct_http_download(mp4, outtmpl, title, msg, job_id)
+        if not final_path or not os.path.exists(final_path):
+            with suppress(Exception):
+                await msg.edit_text("❌ File not found after download.", reply_markup=main_menu_kb().as_markup())
+            return
+
+        # size-limit guard — let user pick a lower quality (we delete the big file)
+        if file_too_large(final_path):
+            with suppress(Exception):
+                await msg.edit_text(
+                    f"✅ Downloaded <code>{esc(os.path.basename(final_path))}</code>\n"
+                    f"Size: {fmt_bytes(os.path.getsize(final_path))}\n"
+                    f"⚠️ Too large for Telegram (&gt;{MAX_FILE_MB} MB). Pick a lower quality.",
+                    parse_mode="HTML",
+                    reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360])
+                )
+            safe_unlink(final_path)
+            return  # keep job so user can choose new quality
+
+        # upload (with retry anti “closing transport”)
+        with suppress(Exception):
+            await msg.edit_text("⬆️ Uploading…", reply_markup=None)
+        await send_with_retry(msg.chat.id, final_path, "✅ Done.", (DEFAULT_MODE == "video"))
+
+        with suppress(Exception):
+            await msg.delete()
 
     except yt_dlp.utils.DownloadError as e:
         s = str(e)
@@ -894,58 +923,17 @@ async def cb_get(cq: CallbackQuery):
             tip = "\n<i>Login/consent required. Add cookies via Cookies ➕ Add.</i>"
         with suppress(Exception):
             await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
-        JOBS.pop(job_id, None)
-        return
     except Exception as e:
         with suppress(Exception):
             await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+    finally:
+        safe_unlink(locals().get("final_path"))
         JOBS.pop(job_id, None)
-        return
-
-    if not final_path or not os.path.exists(final_path):
-        with suppress(Exception):
-            await msg.edit_text("❌ File not found after download.", reply_markup=main_menu_kb().as_markup())
-        JOBS.pop(job_id, None)
-        return
-
-    # size gate
-    if file_too_large(final_path):
-        with suppress(Exception):
-            await msg.edit_text(
-                f"✅ Downloaded <code>{esc(os.path.basename(final_path))}</code>\n"
-                f"Size: {fmt_bytes(os.path.getsize(final_path))}\n"
-                f"⚠️ Too large for Telegram (&gt;{MAX_FILE_MB} MB). Pick a lower quality.",
-                parse_mode="HTML",
-                reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360])
-            )
-        with suppress(Exception):
-            os.remove(final_path)
-        return  # keep job so user can choose new quality
-
-    # Upload (robust)
-    with suppress(Exception):
-        await msg.edit_text("⬆️ Uploading…", reply_markup=None)
-
-    try:
-        await send_with_retry(msg.chat.id, final_path, "✅ Done.", (DEFAULT_MODE == "video"))
-    except Exception as e:
-        with suppress(Exception):
-            await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
-        with suppress(Exception):
-            os.remove(final_path)
-        JOBS.pop(job_id, None)
-        return
-
-    with suppress(Exception):
-        await msg.delete()
-    with suppress(Exception):
-        os.remove(final_path)
-    JOBS.pop(job_id, None)
 
 # ===================== Runner =====================
 async def check_ffmpeg():
-    from shutil import which
-    if which("ffmpeg") is None:
+    from shutil import which as _which
+    if _which("ffmpeg") is None:
         print("WARNING: ffmpeg not found in PATH. Install ffmpeg for HLS/merge.")
 
 async def main():
@@ -954,8 +942,7 @@ async def main():
 
     # robust session to prevent "Cannot write to closing transport"
     timeout = ClientTimeout(total=None, connect=60, sock_connect=60, sock_read=None)
-    connector = TCPConnector(limit=64, force_close=False, enable_cleanup_closed=True)
-    session = AiohttpSession(timeout=timeout, connector=connector)
+    session = AiohttpSession(timeout=timeout)  # no 'connector' arg (keeps compatibility across aiogram builds)
 
     g_bot = Bot(
         BOT_TOKEN,
