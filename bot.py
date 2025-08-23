@@ -219,7 +219,7 @@ def find_direct_media(html: str, base_url: str) -> Tuple[List[str], List[str]]:
     m3u8 = set(); mp4 = set()
     # <source> tags
     for m in re.findall(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.I):
-        u = urljoin(base_url, m); 
+        u = urljoin(base_url, m)
         if ".m3u8" in u: m3u8.add(u)
         if u.lower().endswith(".mp4"): mp4.add(u)
     # common JS keys
@@ -580,7 +580,6 @@ async def add_cookie_text(m: Message, state: FSMContext):
         await state.clear()
         return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
-# Quick delete flow
 @router.callback_query(F.data == "cookies:del")
 async def cookies_del(cq: CallbackQuery):
     await cq.answer()
@@ -779,7 +778,6 @@ async def job_cookie_add(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("job:cookie:paste:"))
 async def job_cookie_paste(cq: CallbackQuery, state: FSMContext):
-    # same as add, just a different hint
     return await job_cookie_add(cq, state)
 
 @router.callback_query(F.data.startswith("job:recheck:"))
@@ -789,7 +787,6 @@ async def job_recheck(cq: CallbackQuery):
     if not job:
         await cq.answer("Job missing.", show_alert=True); return
     await cq.answer("Rechecking…")
-    # re-run the probing block with possible new cookies
     url = job["url"]
     msg = job["msg"]
     info, used_generic, err = await probe_info(url)
@@ -848,7 +845,6 @@ async def job_force_generic(cq: CallbackQuery):
     await cq.answer("Trying generic extractor…")
     url = job["url"]
     msg = job["msg"]
-    # force generic in probe
     base = {
         "skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True,
         "http_headers": common_headers(url), "nocheckcertificate": True,
@@ -924,7 +920,9 @@ async def direct_http_download(mp4_url: str, title: str, msg: Message, job_id: s
     with open(path, "wb") as f:
         for data in r.iter_content(chunk_size=chunk):
             if JOBS.get(job_id, {}).get("cancelled"):
-                r.close(); with suppress(Exception): os.remove(path)
+                r.close()
+                with suppress(Exception):
+                    os.remove(path)
                 raise yt_dlp.utils.DownloadError("Cancelled by user")
             if not data: continue
             f.write(data); downloaded += len(data)
