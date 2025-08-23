@@ -51,7 +51,7 @@ JOBS: Dict[str, dict] = {}
 
 # ===================== Helpers =====================
 def esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def fmt_bytes(n: Optional[float]) -> str:
     if n is None:
@@ -138,7 +138,7 @@ def m3u8_heights(m3u8_text: str) -> List[int]:
     return sorted(hs, reverse=True)
 
 def is_cf_block(err_text: str) -> bool:
-    t = err_text.lower()
+    t = (err_text or "").lower()
     return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
 
 # ===================== Cookies manager =====================
@@ -154,16 +154,11 @@ def clean_domain(s: str) -> Optional[str]:
 def cookie_path_for_domain(domain: str) -> str:
     return os.path.join(COOKIES_DIR, f"{domain}.txt")
 
-def list_cookie_domains() -> List[Tuple[str, int]]:
+def list_cookie_domains() -> List[str]:
     items = []
     for name in os.listdir(COOKIES_DIR):
         if name.endswith(".txt"):
-            path = os.path.join(COOKIES_DIR, name)
-            try:
-                ts = int(os.path.getmtime(path))
-            except Exception:
-                ts = 0
-            items.append((name[:-4], ts))
+            items.append(name[:-4])
     items.sort()
     return items
 
@@ -180,7 +175,7 @@ def find_cookie_for_url(url: str) -> Optional[str]:
         return fallback
     return None
 
-# FSM states for /add and /del
+# FSM states for cookie add/del and stateful prompts
 class CookieAddStates(StatesGroup):
     waiting_domain = State()
     waiting_body = State()
@@ -188,7 +183,54 @@ class CookieAddStates(StatesGroup):
 class CookieDelStates(StatesGroup):
     waiting_domain = State()
 
-# ===================== Keyboards =====================
+class SetMaxState(StatesGroup):
+    waiting_custom = State()
+
+# ===================== Inline Keyboards =====================
+def main_menu_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="➕ Cookies", callback_data="menu:cookies"),
+        InlineKeyboardButton(text="⚙️ Settings", callback_data="menu:settings"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="📊 Status", callback_data="menu:status"),
+        InlineKeyboardButton(text="🧹 Purge", callback_data="menu:purge"),
+    )
+    kb.row(InlineKeyboardButton(text="ℹ️ About", callback_data="menu:about"))
+    return kb
+
+def cookies_menu_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="📜 List", callback_data="cookies:list"),
+        InlineKeyboardButton(text="➕ Add", callback_data="cookies:add"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🗑️ Delete", callback_data="cookies:del"),
+        InlineKeyboardButton(text="🔥 Clear ALL", callback_data="cookies:clear"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:root"))
+    return kb
+
+def settings_menu_kb(current_mode: str, max_mb: int) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text=f"Upload: {current_mode}", callback_data="settings:mode"),
+        InlineKeyboardButton(text=f"Max: {max_mb} MB", callback_data="settings:max"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:root"))
+    return kb
+
+def setmax_choices_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for v in (512, 1024, 1536, 1800, 1900):
+        kb.add(InlineKeyboardButton(text=f"{v} MB", callback_data=f"settings:max:set:{v}"))
+    kb.adjust(3)
+    kb.row(InlineKeyboardButton(text="✍️ Custom…", callback_data="settings:max:custom"))
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:settings"))
+    return kb
+
 def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True):
     kb = InlineKeyboardBuilder()
     if include_best:
@@ -196,73 +238,96 @@ def kb_format_choices(job_id: str, heights: List[int], include_best: bool = True
     for h in sorted(set(heights), reverse=True):
         if h:
             kb.add(InlineKeyboardButton(text=f"{h}p", callback_data=f"get:{job_id}:h{h}"))
-    kb.adjust(3)
+    if heights:
+        kb.adjust(3)
     kb.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel:{job_id}"))
     return kb.as_markup()
 
-# ===================== Commands =====================
+def confirm_kb(prefix: str) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Confirm", callback_data=f"{prefix}:confirm"),
+        InlineKeyboardButton(text="✖️ Cancel", callback_data=f"{prefix}:cancel"),
+    )
+    return kb
+
+# ===================== Commands -> Inline Menus =====================
 @router.message(Command("start"))
 async def start_cmd(m: Message):
-    await m.reply(
-        "Send a video/page URL.\n"
-        "I’ll show actual qualities (Best, 1080p, 720p, …), then download with live <b>% / speed / ETA</b> and send it.\n\n"
-        "<b>Cookies manager</b>\n"
-        "• /cookies — list cookies + help\n"
-        "• /add — add/replace cookies for a site (Netscape .txt or paste)\n"
-        "• /del — delete cookies for a site\n"
-        "• /clearcookies — delete <i>all</i> cookies\n\n"
-        "<b>Other</b>\n"
-        "• /mode — upload as video or document\n"
-        "• /setmax — set max Telegram upload size (MB)\n"
-        "• /status — show active jobs\n"
-        "• /purge — delete old files in downloads\n"
-        "• /about — info & tips",
-        parse_mode="HTML"
+    txt = (
+        "Send a video/page URL to download.\n"
+        "I’ll show qualities (Best/1080p/720p/…), then download with live <b>% / speed / ETA</b> and send it.\n\n"
+        "Use the inline menu below for cookies, settings, status and cleanup."
     )
+    await m.reply(txt, parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+
+@router.message(Command("menu"))
+async def menu_cmd(m: Message):
+    await m.reply("Main menu:", reply_markup=main_menu_kb().as_markup())
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
     await start_cmd(m)
 
-@router.message(Command("about"))
-async def about_cmd(m: Message):
-    await m.reply(
-        "This bot uses <code>yt-dlp</code> to fetch formats from many sites (including adult sites supported by yt-dlp).\n"
-        "For sites with age gates/login, add cookies via <b>/add</b>.\n"
-        "I won’t bypass DRM/paywalls or private Telegram channels.\n"
-        "Tip: Send the <i>video page</i> URL (not just a channel listing).\n",
-        parse_mode="HTML"
-    )
+# ===================== Inline Menu Callbacks =====================
+@router.callback_query(F.data == "menu:root")
+async def menu_root(cq: CallbackQuery):
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text("Main menu:", reply_markup=main_menu_kb().as_markup())
 
-@router.message(Command("mode"))
-async def mode_cmd(m: Message):
-    global DEFAULT_MODE
-    arg = (m.text or "").split(maxsplit=1)
-    if len(arg) == 2 and arg[1].strip().lower() in {"video","document"}:
-        DEFAULT_MODE = arg[1].strip().lower()
-        return await m.reply(f"✅ Upload mode set to <b>{DEFAULT_MODE}</b>.", parse_mode="HTML")
-    await m.reply(f"Current upload mode: <b>{DEFAULT_MODE}</b>\nUse <code>/mode video</code> or <code>/mode document</code>.", parse_mode="HTML")
+@router.callback_query(F.data == "menu:cookies")
+async def menu_cookies(cq: CallbackQuery):
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text("Cookies manager:", reply_markup=cookies_menu_kb().as_markup())
 
-@router.message(Command("setmax"))
-async def setmax_cmd(m: Message):
-    global MAX_FILE_MB
-    parts = (m.text or "").split()
-    if len(parts) == 2 and parts[1].isdigit():
-        MAX_FILE_MB = max(1, int(parts[1]))
-        return await m.reply(f"✅ Max upload size set to <b>{MAX_FILE_MB} MB</b>.", parse_mode="HTML")
-    await m.reply(f"Usage: <code>/setmax 1900</code> (current: <b>{MAX_FILE_MB} MB</b>)", parse_mode="HTML")
+@router.callback_query(F.data == "menu:settings")
+async def menu_settings(cq: CallbackQuery):
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text(
+            "Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup()
+        )
 
-@router.message(Command("status"))
-async def status_cmd(m: Message):
+@router.callback_query(F.data == "menu:status")
+async def menu_status(cq: CallbackQuery):
+    await cq.answer()
     if not JOBS:
-        return await m.reply("No active jobs.")
-    lines = []
-    for jid, j in JOBS.items():
-        lines.append(f"• <code>{jid}</code> — {esc(j.get('title','?'))}")
-    await m.reply("<b>Active jobs</b>:\n" + "\n".join(lines), parse_mode="HTML")
+        text = "No active jobs."
+    else:
+        lines = [f"• <code>{jid}</code> — {esc(j.get('title','?'))}" for jid, j in JOBS.items()]
+        text = "<b>Active jobs</b>:\n" + "\n".join(lines)
+    with suppress(Exception):
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
 
-@router.message(Command("purge"))
-async def purge_cmd(m: Message):
+@router.callback_query(F.data == "menu:purge")
+async def menu_purge(cq: CallbackQuery):
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text("Delete all files in downloads?", reply_markup=confirm_kb("purge").as_markup())
+
+@router.callback_query(F.data == "menu:about")
+async def menu_about(cq: CallbackQuery):
+    await cq.answer()
+    text = (
+        "This bot uses <code>yt-dlp</code> (supports many sites, incl. adult ones).\n"
+        "For login/18+ sites, add cookies via the Cookies menu.\n"
+        "No bypass for DRM/paywalls/private Telegram channels.\n"
+        "Tip: send the direct video page URL."
+    )
+    with suppress(Exception):
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+
+# ===================== Purge confirm =====================
+@router.callback_query(F.data.in_({"purge:confirm", "purge:cancel"}))
+async def purge_confirm(cq: CallbackQuery):
+    act = cq.data.split(":")[1]
+    await cq.answer()
+    if act == "cancel":
+        with suppress(Exception):
+            await cq.message.edit_text("Purge cancelled.", reply_markup=main_menu_kb().as_markup())
+        return
     removed = 0
     for name in os.listdir(DOWNLOAD_DIR):
         p = os.path.join(DOWNLOAD_DIR, name)
@@ -270,43 +335,100 @@ async def purge_cmd(m: Message):
             with suppress(Exception):
                 os.remove(p)
                 removed += 1
-    await m.reply(f"🧹 Deleted {removed} files from <code>{esc(DOWNLOAD_DIR)}</code>.", parse_mode="HTML")
+    with suppress(Exception):
+        await cq.message.edit_text(f"🧹 Deleted {removed} files from <code>{esc(DOWNLOAD_DIR)}</code>.", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
 
-@router.message(Command("cookies"))
-async def cookies_cmd(m: Message):
+# ===================== Settings: mode & max =====================
+@router.callback_query(F.data == "settings:mode")
+async def settings_mode(cq: CallbackQuery):
+    global DEFAULT_MODE
+    DEFAULT_MODE = "document" if DEFAULT_MODE == "video" else "video"
+    await cq.answer(f"Upload mode: {DEFAULT_MODE}", show_alert=False)
+    with suppress(Exception):
+        await cq.message.edit_text("Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup())
+
+@router.callback_query(F.data == "settings:max")
+async def settings_max(cq: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text("Select max upload size:", reply_markup=setmax_choices_kb().as_markup())
+
+@router.callback_query(F.data.startswith("settings:max:set:"))
+async def settings_max_set(cq: CallbackQuery):
+    global MAX_FILE_MB
+    try:
+        MAX_FILE_MB = int(cq.data.rsplit(":", 1)[1])
+    except Exception:
+        await cq.answer("Invalid value.", show_alert=True)
+        return
+    await cq.answer(f"Max set to {MAX_FILE_MB} MB")
+    with suppress(Exception):
+        await cq.message.edit_text("Settings:", reply_markup=settings_menu_kb(DEFAULT_MODE, MAX_FILE_MB).as_markup())
+
+@router.callback_query(F.data == "settings:max:custom")
+async def settings_max_custom(cq: CallbackQuery, state: FSMContext):
+    await state.set_state(SetMaxState.waiting_custom)
+    await cq.answer()
+    with suppress(Exception):
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(text="✖️ Cancel", callback_data="state:cancel"))
+        await cq.message.edit_text("Send a number in MB (e.g., <code>1900</code>):", parse_mode="HTML", reply_markup=kb.as_markup())
+
+@router.message(SetMaxState.waiting_custom)
+async def settings_max_custom_value(m: Message, state: FSMContext):
+    global MAX_FILE_MB
+    val = (m.text or "").strip()
+    if not val.isdigit():
+        return await m.reply("Enter a positive integer (MB). Or tap Cancel.", reply_markup=InlineKeyboardBuilder().add(InlineKeyboardButton(text="Cancel", callback_data="state:cancel")).as_markup())
+    MAX_FILE_MB = max(1, int(val))
+    await state.clear()
+    await m.reply(f"✅ Max upload size set to <b>{MAX_FILE_MB} MB</b>.", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
+
+# Common state cancel
+@router.callback_query(F.data == "state:cancel")
+async def state_cancel(cq: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cq.answer("Cancelled")
+    with suppress(Exception):
+        await cq.message.edit_text("Cancelled.", reply_markup=main_menu_kb().as_markup())
+
+# ===================== Cookies Inline Flow =====================
+@router.callback_query(F.data == "cookies:list")
+async def cookies_list(cq: CallbackQuery):
+    await cq.answer()
     items = list_cookie_domains()
     if not items:
-        text = (
-            "<b>Cookies</b>\n"
-            "No site cookies saved.\n\n"
-            "Use /add to store cookies for a domain (send a .txt file or paste Netscape cookies).\n"
-            "Bot auto-uses matching cookies per URL."
-        )
+        text = "No cookies saved.\nUse ➕ Add to upload Netscape cookies (.txt) or paste cookie text."
     else:
-        lines = [f"• <code>{esc(dom)}</code>" for dom, _ in items]
-        text = (
-            "<b>Cookies</b>\nSaved domains:\n" + "\n".join(lines) +
-            "\n\nUse /add to add/replace, /del to remove one, /clearcookies to wipe all."
-        )
-    await m.reply(text, parse_mode="HTML")
+        lines = [f"• <code>{esc(d)}</code>" for d in items]
+        text = "<b>Saved cookie domains</b>:\n" + "\n".join(lines)
+    with suppress(Exception):
+        await cq.message.edit_text(text, parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
-@router.message(Command("add"))
-async def add_cmd(m: Message, state: FSMContext):
+@router.callback_query(F.data == "cookies:add")
+async def cookies_add(cq: CallbackQuery, state: FSMContext):
     await state.set_state(CookieAddStates.waiting_domain)
-    await m.reply("Send the <b>site</b> (domain or URL) you want to save cookies for.", parse_mode="HTML")
+    await cq.answer()
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✖️ Cancel", callback_data="state:cancel"))
+    with suppress(Exception):
+        await cq.message.edit_text("Send the <b>site</b> (domain or URL) for cookies:", parse_mode="HTML", reply_markup=kb.as_markup())
 
 @router.message(CookieAddStates.waiting_domain)
 async def add_wait_domain(m: Message, state: FSMContext):
     dom = clean_domain(m.text or "")
     if not dom:
-        return await m.reply("Invalid site. Send a domain (e.g. <code>example.com</code>) or a full URL.", parse_mode="HTML")
+        return await m.reply("Invalid site. Send a domain (e.g. <code>example.com</code>) or a full URL.", parse_mode="HTML",
+                             reply_markup=InlineKeyboardBuilder().add(InlineKeyboardButton(text="Cancel", callback_data="state:cancel")).as_markup())
     await state.update_data(domain=dom)
     await state.set_state(CookieAddStates.waiting_body)
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✖️ Cancel", callback_data="state:cancel"))
     await m.reply(
-        f"Okay. Send cookies for <code>{esc(dom)}</code> now:\n"
-        "• Either upload a <b>.txt</b> file (Netscape format),\n"
-        "• Or paste the cookie text here.",
-        parse_mode="HTML"
+        f"Okay. Now upload a <b>.txt</b> (Netscape) or paste cookie text for <code>{esc(dom)}</code>.",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup()
     )
 
 @router.message(CookieAddStates.waiting_body, F.document)
@@ -315,15 +437,15 @@ async def add_cookie_file(m: Message, state: FSMContext):
     dom = data.get("domain")
     if not dom:
         await state.clear()
-        return await m.reply("Session lost. Run /add again.")
+        return await m.reply("Session lost. Start again via Cookies ➕ Add.", reply_markup=main_menu_kb().as_markup())
     path = cookie_path_for_domain(dom)
     try:
         await g_bot.download(m.document, destination=path)
         await state.clear()
-        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML")
+        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
     except Exception as e:
         await state.clear()
-        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML")
+        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
 @router.message(CookieAddStates.waiting_body)
 async def add_cookie_text(m: Message, state: FSMContext):
@@ -331,56 +453,72 @@ async def add_cookie_text(m: Message, state: FSMContext):
     dom = data.get("domain")
     if not dom:
         await state.clear()
-        return await m.reply("Session lost. Run /add again.")
+        return await m.reply("Session lost. Start again via Cookies ➕ Add.", reply_markup=main_menu_kb().as_markup())
     path = cookie_path_for_domain(dom)
     try:
         txt = (m.text or "").strip()
         if not txt:
-            return await m.reply("Empty text. Send a .txt file or paste cookie lines.")
+            return await m.reply("Empty text. Upload a .txt or paste cookie lines.",
+                                 reply_markup=InlineKeyboardBuilder().add(InlineKeyboardButton(text="Cancel", callback_data="state:cancel")).as_markup())
         with open(path, "w", encoding="utf-8") as f:
             f.write(txt + ("\n" if not txt.endswith("\n") else ""))
         await state.clear()
-        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML")
+        return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
     except Exception as e:
         await state.clear()
-        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML")
+        return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
-@router.message(Command("del"))
-async def del_cmd(m: Message, state: FSMContext):
-    await state.set_state(CookieDelStates.waiting_domain)
-    await m.reply("Send the <b>site</b> (domain or URL) whose cookies you want to delete.", parse_mode="HTML")
+@router.callback_query(F.data == "cookies:del")
+async def cookies_del(cq: CallbackQuery, state: FSMContext):
+    await cq.answer()
+    items = list_cookie_domains()
+    if not items:
+        with suppress(Exception):
+            await cq.message.edit_text("No cookies to delete.", reply_markup=cookies_menu_kb().as_markup())
+        return
+    kb = InlineKeyboardBuilder()
+    # keep callback_data short: "cookies:del:xx"
+    for d in items[:90]:  # safety bound to avoid huge markup
+        kb.add(InlineKeyboardButton(text=d, callback_data=f"cookies:del:{d}"))
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:cookies"))
+    with suppress(Exception):
+        await cq.message.edit_text("Select domain to delete:", reply_markup=kb.as_markup())
 
-@router.message(CookieDelStates.waiting_domain)
-async def del_wait_domain(m: Message, state: FSMContext):
-    dom = clean_domain(m.text or "")
-    await state.clear()
-    if not dom:
-        return await m.reply("Invalid site. Send a domain (e.g. <code>example.com</code>) or a full URL.", parse_mode="HTML")
+@router.callback_query(F.data.startswith("cookies:del:"))
+async def cookies_del_domain(cq: CallbackQuery):
+    dom = cq.data.split(":", 2)[2]
     path = cookie_path_for_domain(dom)
     if not os.path.isfile(path):
-        return await m.reply(f"No cookies for <code>{esc(dom)}</code>.", parse_mode="HTML")
-    try:
+        await cq.answer("Not found.")
+        return
+    with suppress(Exception):
         os.remove(path)
-        return await m.reply(f"🗑️ Deleted cookies for <code>{esc(dom)}</code>.", parse_mode="HTML")
-    except Exception as e:
-        return await m.reply(f"❌ Failed to delete: <code>{esc(str(e))}</code>", parse_mode="HTML")
+    await cq.answer(f"Deleted {dom}")
+    with suppress(Exception):
+        await cq.message.edit_text(f"🗑️ Deleted cookies for <code>{esc(dom)}</code>.", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
-@router.message(Command("clearcookies"))
-async def clearcookies_cmd(m: Message):
-    await m.reply(
-        "This will delete <b>ALL</b> saved cookies. Reply with <code>YES</code> to confirm.",
-        parse_mode="HTML"
-    )
+@router.callback_query(F.data == "cookies:clear")
+async def cookies_clear(cq: CallbackQuery):
+    await cq.answer()
+    with suppress(Exception):
+        await cq.message.edit_text("Delete ALL cookie files?", reply_markup=confirm_kb("cookies:clearall").as_markup())
 
-@router.message(F.text == "YES")
-async def clearcookies_yes(m: Message):
+@router.callback_query(F.data.in_({"cookies:clearall:confirm", "cookies:clearall:cancel"}))
+async def cookies_clear_confirm(cq: CallbackQuery):
+    await cq.answer()
+    if cq.data.endswith(":cancel"):
+        with suppress(Exception):
+            await cq.message.edit_text("Cancelled.", reply_markup=cookies_menu_kb().as_markup())
+        return
     deleted = 0
     for name in os.listdir(COOKIES_DIR):
         if name.endswith(".txt"):
             with suppress(Exception):
                 os.remove(os.path.join(COOKIES_DIR, name))
                 deleted += 1
-    await m.reply(f"✅ Deleted {deleted} cookie file(s).")
+    with suppress(Exception):
+        await cq.message.edit_text(f"✅ Deleted {deleted} cookie file(s).", reply_markup=cookies_menu_kb().as_markup())
 
 # ===================== Probe & download =====================
 def token_to_format(token: str) -> str:
@@ -436,7 +574,7 @@ async def probe_info(url: str) -> Tuple[Optional[dict], bool, Optional[str]]:
 @router.message(F.text.regexp(URL_RE))
 async def on_url(m: Message):
     url = URL_RE.search(m.text).group(1)
-    msg = await m.reply("🔎 Checking…")
+    msg = await m.reply("🔎 Checking…", reply_markup=main_menu_kb().as_markup())
 
     job_id = uuid.uuid4().hex[:8]
     job = {"url": url, "title": host_title(url), "msg": msg, "cancelled": False,
@@ -470,7 +608,7 @@ async def on_url(m: Message):
     # direct-media fallback
     note = ""
     if err and is_cf_block(err):
-        note = "\n<i>Site uses anti-bot protection. If you have access, export session cookies to <code>cookies.txt</code> via /add, or paste a direct .mp4/.m3u8.</i>"
+        note = "\n<i>Site uses anti-bot protection. If you have access, add cookies via Cookies ➕ Add, or paste a direct .mp4/.m3u8.</i>"
     elif err:
         note = f"\n<i>Extractor failed ({esc(err)}). We can try a generic attempt.</i>"
 
@@ -509,14 +647,14 @@ async def on_url(m: Message):
         parse_mode="HTML"
     )
 
-# ===================== Callbacks =====================
+# ===================== Download callbacks =====================
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(cq: CallbackQuery):
     _, job_id = cq.data.split(":")
     if job_id in JOBS:
         JOBS[job_id]["cancelled"] = True
     with suppress(Exception):
-        await cq.message.edit_text("🛑 Cancelled.")
+        await cq.message.edit_text("🛑 Cancelled.", reply_markup=main_menu_kb().as_markup())
     JOBS.pop(job_id, None)
     await cq.answer("Cancelled")
 
@@ -533,9 +671,11 @@ async def cb_get(cq: CallbackQuery):
 
     await cq.answer("Downloading…")
     with suppress(Exception):
-        await msg.edit_text(f"⏬ <b>{esc(title)}</b>\nPreparing…",
-                            reply_markup=kb_format_choices(job_id, [], include_best=False),
-                            parse_mode="HTML")
+        await msg.edit_text(
+            f"⏬ <b>{esc(title)}</b>\nPreparing…",
+            reply_markup=kb_format_choices(job_id, [], include_best=False),
+            parse_mode="HTML"
+        )
 
     loop = asyncio.get_running_loop()
     started = {"flag": False, "ts": 0.0, "file": None}
@@ -577,7 +717,6 @@ async def cb_get(cq: CallbackQuery):
             return started["file"] or y.prepare_filename(info)
 
     try:
-        # normal → generic fallback
         try:
             final_path = await asyncio.to_thread(run_dl, False)
         except Exception:
@@ -586,23 +725,22 @@ async def cb_get(cq: CallbackQuery):
         s = str(e)
         tip = ""
         if is_cf_block(s):
-            tip = ("\n<i>Site is using anti-bot protection. I can’t bypass that. "
-                   "If you have access, add cookies via /add or paste a direct .mp4/.m3u8.</i>")
+            tip = ("\n<i>Site is using anti-bot protection. Add cookies via Cookies ➕ Add or provide a direct .mp4/.m3u8.</i>")
         elif any(w in s.lower() for w in ("sign in", "login", "account", "age")):
-            tip = "\n<i>Login/consent required. Add cookies via /add.</i>"
+            tip = "\n<i>Login/consent required. Add cookies via Cookies ➕ Add.</i>"
         with suppress(Exception):
-            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Download error:\n<code>{esc(s)}</code>{tip}", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
         JOBS.pop(job_id, None)
         return
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=None)
+            await msg.edit_text(f"❌ Error:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
         JOBS.pop(job_id, None)
         return
 
     if not final_path or not os.path.exists(final_path):
         with suppress(Exception):
-            await msg.edit_text("❌ File not found after download.", reply_markup=None)
+            await msg.edit_text("❌ File not found after download.", reply_markup=main_menu_kb().as_markup())
         JOBS.pop(job_id, None)
         return
 
@@ -611,14 +749,13 @@ async def cb_get(cq: CallbackQuery):
             await msg.edit_text(
                 f"✅ Downloaded <code>{esc(os.path.basename(final_path))}</code>\n"
                 f"Size: {fmt_bytes(os.path.getsize(final_path))}\n"
-                f"⚠️ Too large for Telegram (&gt;{MAX_FILE_MB} MB). Choose a lower quality.",
+                f"⚠️ Too large for Telegram (&gt;{MAX_FILE_MB} MB). Pick a lower quality.",
                 parse_mode="HTML",
-                reply_markup=None
+                reply_markup=kb_format_choices(job_id, [1080, 720, 480, 360])
             )
         with suppress(Exception):
             os.remove(final_path)
-        JOBS.pop(job_id, None)
-        return
+        return  # keep job so user can choose again
 
     with suppress(Exception):
         await msg.edit_text("⬆️ Uploading…", reply_markup=None)
@@ -634,7 +771,7 @@ async def cb_get(cq: CallbackQuery):
             await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
     except Exception as e:
         with suppress(Exception):
-            await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode=ParseMode.HTML)
+            await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
         with suppress(Exception):
             os.remove(final_path)
         JOBS.pop(job_id, None)
@@ -648,10 +785,9 @@ async def cb_get(cq: CallbackQuery):
 
 # ===================== Runner =====================
 async def check_ffmpeg():
-    # yt-dlp can download without ffmpeg, but merging/HLS often needs it
     from shutil import which
     if which("ffmpeg") is None:
-        print("WARNING: ffmpeg not found in PATH. Install ffmpeg for best results (HLS/merge).")
+        print("WARNING: ffmpeg not found in PATH. Install ffmpeg for HLS/merge.")
 
 async def main():
     global g_bot
