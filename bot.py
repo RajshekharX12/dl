@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# bot.py
 import asyncio
 import os
 import re
@@ -7,6 +8,8 @@ import uuid
 from contextlib import suppress
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, urljoin
+import mimetypes
+import math
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -20,12 +23,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+# robust HTTP session for uploads (fixes "Cannot write to closing transport")
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout, TCPConnector
+
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import yt_dlp
 import requests
+from http.cookiejar import MozillaCookieJar
 
 # ===================== Config =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -107,7 +115,7 @@ def common_headers(url: str) -> dict:
 
 async def http_get_text_async(url: str) -> str:
     def _get():
-        r = requests.get(url, headers=common_headers(url), timeout=20, allow_redirects=True)
+        r = requests.get(url, headers=common_headers(url), timeout=25, allow_redirects=True)
         r.raise_for_status()
         return r.text
     return await asyncio.to_thread(_get)
@@ -141,7 +149,7 @@ def is_cf_block(err_text: str) -> bool:
     t = (err_text or "").lower()
     return ("cloudflare" in t and ("403" in t or "challenge" in t)) or ("403" in t and "forbidden" in t)
 
-# ===================== Cookies manager =====================
+# ---------- Cookies helpers ----------
 def clean_domain(s: str) -> Optional[str]:
     s = (s or "").strip()
     if not s:
@@ -175,18 +183,49 @@ def find_cookie_for_url(url: str) -> Optional[str]:
         return fallback
     return None
 
-# FSM states for cookie add/del and stateful prompts
-class CookieAddStates(StatesGroup):
-    waiting_domain = State()
-    waiting_body = State()
+def cookiejar_for_url(url: str) -> Optional[MozillaCookieJar]:
+    path = find_cookie_for_url(url)
+    if not path:
+        return None
+    try:
+        jar = MozillaCookieJar()
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+        return jar
+    except Exception:
+        return None
 
-class CookieDelStates(StatesGroup):
-    waiting_domain = State()
+# ---------- Accept raw Cookie: header or curl -H Cookie ----------
+import time as _time
+_COOKIE_HDR_RE = re.compile(r"(?:^|\b)Cookie:\s*([^\"'\r\n]+)", re.I)
+_CURL_COOKIE_RE = re.compile(r"-H\s*[\"']?Cookie:\s*([^\"']+)[\"']?", re.I)
 
-class SetMaxState(StatesGroup):
-    waiting_custom = State()
+def cookie_text_to_netscape(txt: str, domain: str) -> Optional[str]:
+    src = (txt or "").strip()
+    m = _CURL_COOKIE_RE.search(src) or _COOKIE_HDR_RE.search(src)
+    if m:
+        src = m.group(1)
+    if "=" not in src and ";" not in src:
+        return None
+    pairs = []
+    for part in src.strip().strip(";").split(";"):
+        if "=" not in part:
+            continue
+        name, val = part.split("=", 1)
+        name = name.strip()
+        val = val.strip()
+        if not name:
+            continue
+        pairs.append((name, val))
+    if not pairs:
+        return None
+    exp = int(_time.time()) + 180 * 24 * 3600  # 180 days
+    dom = "." + domain.lstrip(".")
+    lines = ["# Netscape HTTP Cookie File"]
+    for name, val in pairs:
+        lines.append(f"{dom}\tTRUE\t/\tFALSE\t{exp}\t{name}\t{val}")
+    return "\n".join(lines) + "\n"
 
-# ===================== Inline Keyboards =====================
+# ===================== Keyboards (inline) =====================
 def main_menu_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -250,6 +289,17 @@ def confirm_kb(prefix: str) -> InlineKeyboardBuilder:
         InlineKeyboardButton(text="✖️ Cancel", callback_data=f"{prefix}:cancel"),
     )
     return kb
+
+# ===================== States =====================
+class CookieAddStates(StatesGroup):
+    waiting_domain = State()
+    waiting_body = State()
+
+class CookieDelStates(StatesGroup):
+    waiting_domain = State()
+
+class SetMaxState(StatesGroup):
+    waiting_custom = State()
 
 # ===================== Commands -> Inline Menus =====================
 @router.message(Command("start"))
@@ -385,7 +435,6 @@ async def settings_max_custom_value(m: Message, state: FSMContext):
     await state.clear()
     await m.reply(f"✅ Max upload size set to <b>{MAX_FILE_MB} MB</b>.", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
 
-# Common state cancel
 @router.callback_query(F.data == "state:cancel")
 async def state_cancel(cq: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -399,7 +448,7 @@ async def cookies_list(cq: CallbackQuery):
     await cq.answer()
     items = list_cookie_domains()
     if not items:
-        text = "No cookies saved.\nUse ➕ Add to upload Netscape cookies (.txt) or paste cookie text."
+        text = "No cookies saved.\nUse ➕ Add to upload Netscape cookies (.txt) or paste cookie text / Cookie: header."
     else:
         lines = [f"• <code>{esc(d)}</code>" for d in items]
         text = "<b>Saved cookie domains</b>:\n" + "\n".join(lines)
@@ -426,7 +475,7 @@ async def add_wait_domain(m: Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="✖️ Cancel", callback_data="state:cancel"))
     await m.reply(
-        f"Okay. Now upload a <b>.txt</b> (Netscape) or paste cookie text for <code>{esc(dom)}</code>.",
+        f"Upload a <b>.txt</b> (Netscape) or paste cookie text / <code>Cookie:</code> header for <code>{esc(dom)}</code>.",
         parse_mode="HTML",
         reply_markup=kb.as_markup()
     )
@@ -460,8 +509,10 @@ async def add_cookie_text(m: Message, state: FSMContext):
         if not txt:
             return await m.reply("Empty text. Upload a .txt or paste cookie lines.",
                                  reply_markup=InlineKeyboardBuilder().add(InlineKeyboardButton(text="Cancel", callback_data="state:cancel")).as_markup())
+        ns = cookie_text_to_netscape(txt, dom)
+        content = ns if ns is not None else txt
         with open(path, "w", encoding="utf-8") as f:
-            f.write(txt + ("\n" if not txt.endswith("\n") else ""))
+            f.write(content if content.endswith("\n") else content + "\n")
         await state.clear()
         return await m.reply(f"✅ Saved cookies to <code>{esc(path)}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
     except Exception as e:
@@ -469,7 +520,7 @@ async def add_cookie_text(m: Message, state: FSMContext):
         return await m.reply(f"❌ Failed to save cookies: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=cookies_menu_kb().as_markup())
 
 @router.callback_query(F.data == "cookies:del")
-async def cookies_del(cq: CallbackQuery, state: FSMContext):
+async def cookies_del(cq: CallbackQuery):
     await cq.answer()
     items = list_cookie_domains()
     if not items:
@@ -477,8 +528,7 @@ async def cookies_del(cq: CallbackQuery, state: FSMContext):
             await cq.message.edit_text("No cookies to delete.", reply_markup=cookies_menu_kb().as_markup())
         return
     kb = InlineKeyboardBuilder()
-    # keep callback_data short: "cookies:del:xx"
-    for d in items[:90]:  # safety bound to avoid huge markup
+    for d in items[:90]:
         kb.add(InlineKeyboardButton(text=d, callback_data=f"cookies:del:{d}"))
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:cookies"))
@@ -520,7 +570,7 @@ async def cookies_clear_confirm(cq: CallbackQuery):
     with suppress(Exception):
         await cq.message.edit_text(f"✅ Deleted {deleted} cookie file(s).", reply_markup=cookies_menu_kb().as_markup())
 
-# ===================== Probe & download =====================
+# ===================== yt-dlp helpers =====================
 def token_to_format(token: str) -> str:
     if token == "best":
         return "bv*+ba/b"
@@ -536,16 +586,18 @@ def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 12,  # faster HLS
         "progress_hooks": [hook],
         "merge_output_format": "mp4",
-        "retries": 5,
-        "fragment_retries": 10,
-        "socket_timeout": 15,
+        "retries": 7,
+        "fragment_retries": 20,
+        "socket_timeout": 25,
         "http_headers": common_headers(url),
         "nocheckcertificate": True,
         "geo_bypass": True,
-        "extractor_retries": 3,
+        "extractor_retries": 4,
+        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks often speed up
+        "throttled_rate": None,
     }
     cookiefile = find_cookie_for_url(url)
     if cookiefile:
@@ -578,10 +630,9 @@ async def on_url(m: Message):
 
     job_id = uuid.uuid4().hex[:8]
     job = {"url": url, "title": host_title(url), "msg": msg, "cancelled": False,
-           "dl_url": None, "dl_is_direct": False}
+           "dl_url": None, "dl_is_direct": False, "direct_mp4": None}
     JOBS[job_id] = job
 
-    # yt-dlp probe
     info, used_generic, err = await probe_info(url)
     if info:
         heights: List[int] = []
@@ -605,25 +656,21 @@ async def on_url(m: Message):
         )
         return
 
-    # direct-media fallback
+    # Fallback probe to sniff direct media (will also be used as Strategy 3/4 later)
     note = ""
     if err and is_cf_block(err):
-        note = "\n<i>Site uses anti-bot protection. If you have access, add cookies via Cookies ➕ Add, or paste a direct .mp4/.m3u8.</i>"
-    elif err:
-        note = f"\n<i>Extractor failed ({esc(err)}). We can try a generic attempt.</i>"
-
+        note = "\n<i>Site uses anti-bot protection. If you have access, add cookies, or paste a direct .mp4/.m3u8.</i>"
     html = None
     with suppress(Exception):
         html = await http_get_text_async(url)
     if html:
         m3u8s, mp4s = find_direct_media(html, url)
         if m3u8s:
-            m3u8_url = m3u8s[0]
             mtxt = ""
             with suppress(Exception):
-                mtxt = await http_get_text_async(m3u8_url)
+                mtxt = await http_get_text_async(m3u8s[0])
             heights = m3u8_heights(mtxt or "") or [1080, 720, 480, 360]
-            job["dl_url"] = m3u8_url
+            job["dl_url"] = m3u8s[0]
             job["dl_is_direct"] = True
             await msg.edit_text(
                 f"🎬 <b>{esc(job['title'])}</b>\n(Direct HLS found){note}\nChoose a quality:",
@@ -633,6 +680,7 @@ async def on_url(m: Message):
             return
         if mp4s:
             job["dl_url"] = mp4s[0]
+            job["direct_mp4"] = mp4s[0]
             job["dl_is_direct"] = True
             await msg.edit_text(
                 f"🎬 <b>{esc(job['title'])}</b>\n(Direct MP4 found){note}\nChoose:",
@@ -647,7 +695,92 @@ async def on_url(m: Message):
         parse_mode="HTML"
     )
 
-# ===================== Download callbacks =====================
+# ===================== 4-Strategy Download =====================
+async def sniff_direct_once(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (m3u8_url, mp4_url) or (None,None)."""
+    with suppress(Exception):
+        html = await http_get_text_async(url)
+        if html:
+            m3u8s, mp4s = find_direct_media(html, url)
+            return (m3u8s[0] if m3u8s else None, mp4s[0] if mp4s else None)
+    return (None, None)
+
+async def direct_http_download(mp4_url: str, outtmpl: str, title: str, msg: Message, job_id: str) -> Optional[str]:
+    """Strategy 4: stream direct MP4 via requests with cookiejar + progress."""
+    # derive filename
+    parsed = urlparse(mp4_url)
+    name = os.path.basename(parsed.path) or "video.mp4"
+    if not os.path.splitext(name)[1]:
+        name += ".mp4"
+    safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", title)[:150]
+    filename = f"{safe_title} [direct].{os.path.splitext(name)[1].lstrip('.')}"
+    path = os.path.join(DOWNLOAD_DIR, filename)
+
+    # session with cookies
+    jar = cookiejar_for_url(mp4_url)
+    sess = requests.Session()
+    if jar: sess.cookies = jar
+    sess.headers.update(common_headers(mp4_url))
+    # try to probe size
+    total = None
+    try:
+        h = sess.head(mp4_url, timeout=25, allow_redirects=True)
+        if 'content-length' in h.headers:
+            total = int(h.headers['content-length'])
+    except Exception:
+        pass
+
+    # stream
+    r = sess.get(mp4_url, stream=True, timeout=25, allow_redirects=True)
+    r.raise_for_status()
+
+    loop = asyncio.get_running_loop()
+    downloaded = 0
+    chunk = 2 * 1024 * 1024  # 2MB
+    last = 0.0
+    with open(path, "wb") as f:
+        for data in r.iter_content(chunk_size=chunk):
+            if JOBS.get(job_id, {}).get("cancelled"):
+                r.close()
+                with suppress(Exception): os.remove(path)
+                raise yt_dlp.utils.DownloadError("Cancelled by user")
+            if not data:
+                continue
+            f.write(data)
+            downloaded += len(data)
+            now = time.time()
+            if now - last > 1.0:
+                last = now
+                pct = (downloaded / total * 100.0) if total else 0.0
+                spd = None  # not trivial without timestamps per-chunk; keep UI consistent
+                text = (
+                    f"⏬ <b>{esc(title)}</b>\n"
+                    f"{bar(pct if total else 0.0)}  {(pct if total else 0.0):.1f}%\n"
+                    f"{fmt_bytes(downloaded)} / {fmt_bytes(total)}"
+                )
+                schedule_edit(loop, msg, text, reply_markup=None)
+    return path
+
+async def send_with_retry(chat_id: int, path: str, caption: str, as_video: bool) -> None:
+    """Retry upload once if transport hiccups."""
+    for attempt in range(2):
+        try:
+            if as_video and looks_video(path):
+                try:
+                    await g_bot.send_video(chat_id, FSInputFile(path), caption=caption)
+                except Exception:
+                    await g_bot.send_document(chat_id, FSInputFile(path), caption=caption)
+            else:
+                await g_bot.send_document(chat_id, FSInputFile(path), caption=caption)
+            return
+        except Exception as e:
+            # classic aiohttp noise when connection closes mid-upload
+            if "closing transport" in str(e).lower() or "Timeout" in str(e):
+                if attempt == 0:
+                    await asyncio.sleep(2.0)
+                    continue
+            raise
+
 @router.callback_query(F.data.startswith("cancel:"))
 async def cb_cancel(cq: CallbackQuery):
     _, job_id = cq.data.split(":")
@@ -665,10 +798,9 @@ async def cb_get(cq: CallbackQuery):
     if not job:
         return await cq.answer("Job missing.", show_alert=True)
 
-    src_url = job.get("dl_url") or job["url"]
+    src_url = job.get("url")
     title = job["title"]
     msg = job["msg"]
-
     await cq.answer("Downloading…")
     with suppress(Exception):
         await msg.edit_text(
@@ -680,6 +812,7 @@ async def cb_get(cq: CallbackQuery):
     loop = asyncio.get_running_loop()
     started = {"flag": False, "ts": 0.0, "file": None}
 
+    # common progress hook for yt-dlp strategies
     def hook(d):
         if JOBS.get(job_id, {}).get("cancelled"):
             raise yt_dlp.utils.DownloadError("Cancelled by user")
@@ -708,24 +841,55 @@ async def cb_get(cq: CallbackQuery):
     fmt_sel = token_to_format(token)
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title).200B [%(id)s].%(ext)s")
 
-    def run_dl(force_generic: bool = False):
-        opts = build_ytdlp_opts(src_url, fmt_sel, outtmpl, hook)
+    def ytdlp_run(url: str, force_generic: bool = False):
+        opts = build_ytdlp_opts(url, fmt_sel, outtmpl, hook)
         if force_generic:
             opts["force_generic_extractor"] = True
         with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(src_url, download=True)
+            info = y.extract_info(url, download=True)
             return started["file"] or y.prepare_filename(info)
 
+    # --------- 4 STRATEGIES (auto) ----------
+    final_path = None
     try:
+        # Strategy 1: yt-dlp native extractor
         try:
-            final_path = await asyncio.to_thread(run_dl, False)
+            final_path = await asyncio.to_thread(ytdlp_run, src_url, False)
         except Exception:
-            final_path = await asyncio.to_thread(run_dl, True)
+            # Strategy 2: yt-dlp generic extractor
+            try:
+                final_path = await asyncio.to_thread(ytdlp_run, src_url, True)
+            except Exception:
+                # Strategy 3: sniff direct m3u8/mp4, prefer m3u8 via yt-dlp
+                m3u8_url, mp4_url = None, None
+                if job.get("dl_url"):
+                    # we already sniffed earlier
+                    if job.get("dl_url", "").endswith(".m3u8"):
+                        m3u8_url = job["dl_url"]
+                    elif job.get("direct_mp4"):
+                        mp4_url = job["direct_mp4"]
+                    else:
+                        # ensure both checked
+                        m3u8_url, mp4_url = await sniff_direct_once(src_url)
+                else:
+                    m3u8_url, mp4_url = await sniff_direct_once(src_url)
+
+                if m3u8_url:
+                    try:
+                        final_path = await asyncio.to_thread(ytdlp_run, m3u8_url, False)
+                    except Exception:
+                        pass
+
+                # Strategy 4: direct MP4 stream via requests (only if still no file and mp4 exists)
+                if not final_path and (mp4_url or job.get("direct_mp4")):
+                    mp4 = mp4_url or job.get("direct_mp4")
+                    final_path = await direct_http_download(mp4, outtmpl, title, msg, job_id)
+
     except yt_dlp.utils.DownloadError as e:
         s = str(e)
         tip = ""
         if is_cf_block(s):
-            tip = ("\n<i>Site is using anti-bot protection. Add cookies via Cookies ➕ Add or provide a direct .mp4/.m3u8.</i>")
+            tip = ("\n<i>Site is using anti-bot protection. Add cookies or provide a direct .mp4/.m3u8.</i>")
         elif any(w in s.lower() for w in ("sign in", "login", "account", "age")):
             tip = "\n<i>Login/consent required. Add cookies via Cookies ➕ Add.</i>"
         with suppress(Exception):
@@ -744,6 +908,7 @@ async def cb_get(cq: CallbackQuery):
         JOBS.pop(job_id, None)
         return
 
+    # size gate
     if file_too_large(final_path):
         with suppress(Exception):
             await msg.edit_text(
@@ -755,20 +920,14 @@ async def cb_get(cq: CallbackQuery):
             )
         with suppress(Exception):
             os.remove(final_path)
-        return  # keep job so user can choose again
+        return  # keep job so user can choose new quality
 
+    # Upload (robust)
     with suppress(Exception):
         await msg.edit_text("⬆️ Uploading…", reply_markup=None)
 
-    caption = "✅ Done."
     try:
-        if DEFAULT_MODE == "video" and looks_video(final_path):
-            try:
-                await g_bot.send_video(msg.chat.id, FSInputFile(final_path), caption=caption)
-            except Exception:
-                await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
-        else:
-            await g_bot.send_document(msg.chat.id, FSInputFile(final_path), caption=caption)
+        await send_with_retry(msg.chat.id, final_path, "✅ Done.", (DEFAULT_MODE == "video"))
     except Exception as e:
         with suppress(Exception):
             await msg.edit_text(f"❌ Upload failed: <code>{esc(str(e))}</code>", parse_mode="HTML", reply_markup=main_menu_kb().as_markup())
@@ -792,7 +951,17 @@ async def check_ffmpeg():
 async def main():
     global g_bot
     await check_ffmpeg()
-    g_bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    # robust session to prevent "Cannot write to closing transport"
+    timeout = ClientTimeout(total=None, connect=60, sock_connect=60, sock_read=None)
+    connector = TCPConnector(limit=64, force_close=False, enable_cleanup_closed=True)
+    session = AiohttpSession(timeout=timeout, connector=connector)
+
+    g_bot = Bot(
+        BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     await g_bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(g_bot, allowed_updates=dp.resolve_used_update_types())
 
