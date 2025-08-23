@@ -21,9 +21,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# robust HTTP session for uploads (fixes "Cannot write to closing transport")
+# robust HTTP session for uploads (prevents "Cannot write to closing transport")
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout
 
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -47,7 +46,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(COOKIES_DIR, exist_ok=True)
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
-ARIA2 = which("aria2c") is not None  # auto use if installed
+ARIA2 = which("aria2c") is not None  # auto-use if installed
 
 # ===================== Aiogram =====================
 dp = Dispatcher(storage=MemoryStorage())
@@ -606,13 +605,13 @@ def build_ytdlp_opts(url: str, fmt: str, outtmpl: str, hook):
         "nocheckcertificate": True,
         "geo_bypass": True,
         "extractor_retries": 4,
-        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks
+        "http_chunk_size": 10 * 1024 * 1024,  # 10MB chunks (speeds up on many hosts)
         "throttled_rate": None,
     }
     cookiefile = find_cookie_for_url(url)
     if cookiefile:
         opts["cookiefile"] = cookiefile
-    # if aria2c available, let yt-dlp use it for non-HLS direct media (it can speed up a lot)
+    # Speed booster: aria2c for non-HLS direct media (if installed)
     if ARIA2:
         opts["external_downloader"] = "aria2c"
         opts["external_downloader_args"] = {
@@ -906,7 +905,7 @@ async def cb_get(cq: CallbackQuery):
             safe_unlink(final_path)
             return  # keep job so user can choose new quality
 
-        # upload (with retry anti “closing transport”)
+        # upload (with retry to avoid “closing transport”)
         with suppress(Exception):
             await msg.edit_text("⬆️ Uploading…", reply_markup=None)
         await send_with_retry(msg.chat.id, final_path, "✅ Done.", (DEFAULT_MODE == "video"))
@@ -932,17 +931,16 @@ async def cb_get(cq: CallbackQuery):
 
 # ===================== Runner =====================
 async def check_ffmpeg():
-    from shutil import which as _which
-    if _which("ffmpeg") is None:
+    if which("ffmpeg") is None:
         print("WARNING: ffmpeg not found in PATH. Install ffmpeg for HLS/merge.")
 
 async def main():
     global g_bot
     await check_ffmpeg()
 
-    # robust session to prevent "Cannot write to closing transport"
-    timeout = ClientTimeout(total=None, connect=60, sock_connect=60, sock_read=None)
-    session = AiohttpSession(timeout=timeout)  # no 'connector' arg (keeps compatibility across aiogram builds)
+    # IMPORTANT: aiogram expects numeric seconds here, not a ClientTimeout object
+    timeout_seconds = int(os.getenv("BOT_HTTP_TIMEOUT", "60"))
+    session = AiohttpSession(timeout=timeout_seconds)
 
     g_bot = Bot(
         BOT_TOKEN,
